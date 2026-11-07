@@ -936,8 +936,9 @@
     scrollChat(true);
   }
 
-  function renderChat(force) {
+  function renderChat(force, keepPos) {
     if (!chatRefs.log || !S.cur) return;
+    var prevTop = chatRefs.log.scrollTop, prevMax = chatRefs.log.scrollHeight;
     if (force) {
       chatRefs.log.innerHTML = '';
       chatRefs.liveNode = null;
@@ -958,6 +959,8 @@
         chatRefs.log.appendChild(e);
       }
     }
+    var stick = chatRefs.log.scrollTop + chatRefs.log.clientHeight >= chatRefs.log.scrollHeight - 140;
+    var top = chatRefs.log.scrollTop;
     updateLiveNode(S.cur);
     // Projections only exist after the snapshot: fill the stats line and chips now.
     if (chatRefs.statline) {
@@ -966,7 +969,9 @@
       chatRefs.statline.style.display = stText ? '' : 'none';
     }
     renderComposer();
-    scrollChat(false);
+    if (keepPos && prevMax) { chatRefs.log.scrollTop = Math.max(0, prevTop + (chatRefs.log.scrollHeight - prevMax)); }
+    else if (force || stick) { chatRefs.log.scrollTop = chatRefs.log.scrollHeight; }
+    else { chatRefs.log.scrollTop = top; }
   }
 
   function loadOlder(btn) {
@@ -980,7 +985,7 @@
     }).then(function (page) {
       cur.records = (page.records || []).concat(cur.records);
       cur.hasMore = !!page.hasMore;
-      renderChat(true);
+      renderChat(true, true);
     }).catch(function (e) { btn.textContent = '载入更早的消息'; toast('失败：' + e.message); });
   }
 
@@ -3264,6 +3269,7 @@
 
   window.__DSHM__ = {
     state: S, rpc: rpc, md: md, login: login, back: goBack,
+    chatRefs: chatRefs, renderChat: renderChat, setRendered: function (n) { renderedCount = n; },
     // test hooks (used by test/harness*.mjs)
     open: function (id, title) { openSession(id, title); },
     openTerminal: openTerminal,
