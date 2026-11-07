@@ -635,6 +635,7 @@
     if (S.view === 'files') return renderFiles();
     if (S.view === 'jobs') return renderJobs();
     if (S.view === 'goal') return renderGoal();
+    if (S.view === 'trajectory') return renderTrajectory();
     if (S.view === 'chat' && S.cur) return renderChatView();
     return renderSessions();
   }
@@ -796,6 +797,7 @@
     items.push(['文件', function () { openPanel('files'); }]);
     items.push(['后台任务', function () { openPanel('jobs'); }]);
     items.push(['长期目标', function () { openPanel('goal'); }]);
+    items.push(['轨迹', function () { openPanel('trajectory'); }]);
     items.push(['命令面板', commandPalette]);
     items.push(['选择模型', pickModel]);
     items.push(['重命名会话', renameCur]);
@@ -1015,7 +1017,10 @@
       if (!item.text) return;
       node = el('div', 'msg note', item.text);
     }
-    if (node) log.appendChild(node);
+    if (node) {
+      if (item.seq != null) node.dataset.seq = String(item.seq);
+      log.appendChild(node);
+    }
   }
 
   function byteLen(s) { try { return new Blob([s || '']).size; } catch (e) { return (s || '').length; } }
@@ -1463,6 +1468,63 @@
     node.addEventListener('contextmenu', function (ev) { ev.preventDefault(); fn(); });
   }
 
+  // ---------- trajectory (turns / steps / tools / duration)
+  function renderTrajectory() {
+    if (!needSession()) return;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('轨迹'));
+    var sc = el('div', 'scroll');
+    var turns = {};
+    (S.cur.records || []).forEach(function (r) {
+      var e = r.event || {};
+      var d = e.data || {};
+      if (d.turn == null) return;
+      var o = turns[d.turn] || (turns[d.turn] = { steps: 0, tools: 0, t0: null, t1: null });
+      if (e.type === 'step/start') o.steps++;
+      if (e.type === 'tool/call') o.tools++;
+      if (e.time) {
+        o.t0 = o.t0 === null ? e.time : Math.min(o.t0, e.time);
+        o.t1 = o.t1 === null ? e.time : Math.max(o.t1, e.time);
+      }
+    });
+    var keys = Object.keys(turns).map(Number).sort(function (a, b) { return b - a; });
+    if (!keys.length) sc.appendChild(el('div', 'empty', '还没有可展示的回合'));
+    var outline = S.cur.projections.turnOutline || [];
+    keys.forEach(function (k) {
+      var o = turns[k];
+      var hit = outline.filter(function (x) { return x.turn === k; })[0] || {};
+      var row = el('div', 'row');
+      var g = el('div', 'grow');
+      var prompt = hit.prompt ? String(hit.prompt).replace(/\s+/g, ' ') : '';
+      g.appendChild(el('div', 't', '回合 ' + k + (prompt ? ' · ' + truncate(prompt, 34) : '')));
+      var m = el('div', 'm');
+      var secs = (o.t0 && o.t1) ? Math.max(1, Math.round((o.t1 - o.t0) / 1000)) + 's' : '';
+      m.appendChild(el('span', null, [o.steps + ' 步', o.tools + ' 工具', secs].filter(Boolean).join(' · ')));
+      g.appendChild(m);
+      row.appendChild(g);
+      if (hit.seq != null) row.addEventListener('click', (function (s) { return function () { jumpToSeq(s); }; })(hit.seq));
+      sc.appendChild(row);
+    });
+    frag.appendChild(sc);
+    mount(frag);
+  }
+
+  /** Close the panel and scroll the conversation to the given event seq. */
+  function jumpToSeq(seq) {
+    closePanel();
+    setTimeout(function () {
+      var log = chatRefs.log;
+      if (!log) return;
+      var nodes = log.querySelectorAll('[data-seq]');
+      var best = null;
+      for (var i = 0; i < nodes.length; i++) {
+        var v = Number(nodes[i].dataset.seq);
+        if (!isNaN(v) && v <= seq) best = nodes[i];
+      }
+      (best || nodes[0] || log).scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }, 150);
+  }
+
   // ─────────────────────────── panels: files / jobs / goal / more settings
   //
   // Panel shapes verified against the host type declarations:
@@ -1878,7 +1940,7 @@
   /** Android back button: chat → list → settings → exit. */
   function goBack() {
     if (S.view === 'chat') { leaveChat(); return 'nav'; }
-    if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more') { closePanel(); return 'nav'; }
+    if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more' || S.view === 'trajectory') { closePanel(); return 'nav'; }
     if (S.view === 'settings') { S.view = S.server ? 'sessions' : 'setup'; render(); return 'nav'; }
     if (S.view === 'login') { S.view = 'sessions'; render(); return 'nav'; }
     return 'exit';
