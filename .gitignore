@@ -1,0 +1,10 @@
+# local-only
+recon/
+test/
+scratch/
+*.log
+.gradle/
+build/
+local.properties
+tools/
+
