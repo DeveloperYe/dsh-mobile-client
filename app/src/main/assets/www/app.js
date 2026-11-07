@@ -187,6 +187,9 @@
     lastError: '',
     showInject: lsGet(K.inject, '0') === '1',
     pending: [],          // queued image parts
+    clientId: '',         // $events stream generation id (required for every reply)
+    forwardId: null,      // $events stream handle
+    interactive: [],      // unanswered approval / user-question requests
   };
 
   function saveCache() {
@@ -306,6 +309,134 @@
     return S.mux;
   }
 
+  // ─────────────────────────────── forwarded events ($events) + interactive flows
+  //
+  // The host pushes two kinds of frame on this stream:
+  //   {type:'emit', event, args}                            — notification, no reply
+  //   {type:'waterfall', event, eventId, agentId, request}   — MUST be answered,
+  //      otherwise the agent blocks forever (approval/request,
+  //      user-questions/request). The answer is an ordinary unary call to
+  //      POST /api/$events/result with {clientId, eventId, outcome}.
+  function attachForwardedEvents() {
+    if (S.forwardId) return;
+    S.forwardId = mux().open('$events', {}, {
+      onFrame: onForwardFrame,
+      onEnd: function () { S.forwardId = null; S.clientId = ''; },
+      onError: function () { S.forwardId = null; S.clientId = ''; }
+    });
+  }
+
+  function onForwardFrame(w) {
+    if (!w || !w.type) return;
+    if (w.type === 'ready') { S.clientId = w.clientId || ''; return; }
+    if (w.type === 'emit') { onForwardEmit(w); return; }
+    if (w.type === 'cancel') { removeInteractive(w.eventId); return; }
+    if (w.type === 'waterfall') { onWaterfall(w); return; }
+  }
+
+  /** Keep the session list live from host notifications instead of polling hard. */
+  function onForwardEmit(w) {
+    var a = w.args || [];
+    if (w.event === 'api-session/status') {
+      var s = byId(a[0]);
+      if (s) s.running = !!a[1];
+      if (S.cur && S.cur.id === a[0]) { S.cur.running = !!a[1]; renderComposer(); }
+    } else if (w.event === 'api-session/added') {
+      if (a[0] && a[0].sessionId) {
+        var cur = byId(a[0].sessionId);
+        if (cur) { for (var k in a[0]) cur[k] = a[0][k]; } else S.sessions.push(a[0]);
+      }
+    } else if (w.event === 'api-session/activity') {
+      var s2 = byId(a[0]);
+      if (s2) s2.updatedAt = a[1];
+    } else if (w.event === 'api-session/removed') {
+      S.sessions = S.sessions.filter(function (x) { return x.sessionId !== a[0]; });
+    } else {
+      return;
+    }
+    S.sessions.sort(function (x, y) { return (y.updatedAt || 0) - (x.updatedAt || 0); });
+    saveCache();
+    scheduleListRender();
+  }
+
+  function byId(id) {
+    for (var i = 0; i < S.sessions.length; i++) if (S.sessions[i].sessionId === id) return S.sessions[i];
+    return null;
+  }
+
+  var listRenderQueued = false;
+  function scheduleListRender() {
+    if (listRenderQueued || S.view !== 'sessions') return;
+    listRenderQueued = true;
+    requestAnimationFrame(function () { listRenderQueued = false; if (S.view === 'sessions') render(); });
+  }
+
+  function onWaterfall(w) {
+    if (w.event === 'approval/request' || w.event === 'user-questions/request') {
+      // Replacing a stale card for the same session keeps the panel unambiguous.
+      S.interactive = S.interactive.filter(function (it) { return it.eventId !== w.eventId; });
+      S.interactive.push({
+        kind: w.event === 'approval/request' ? 'approval' : 'question',
+        eventId: w.eventId,
+        agentId: w.agentId,
+        request: w.request || {},
+        picked: {},          // questionId -> { selected:[], custom:'' }
+        custom: {},
+        sent: false
+      });
+      if (S.view === 'chat') renderComposer();
+      toast(w.event === 'approval/request' ? '需要你批准一个操作' : '模型有问题要问你');
+      return;
+    }
+    // Unknown waterfall: delegate so this client is never the reason a turn stalls.
+    replyEvent(w.eventId, { kind: 'next' });
+  }
+
+  function removeInteractive(eventId) {
+    S.interactive = S.interactive.filter(function (it) { return it.eventId !== eventId; });
+    if (S.view === 'chat') renderComposer();
+  }
+
+  /** Answer one forwarded waterfall request; `outcome` is next | result | rejected. */
+  function replyEvent(eventId, outcome) {
+    if (!S.clientId) return Promise.reject(new ApiError('事件流未就绪', 'no-client-id'));
+    return rpc('$events/result', { clientId: S.clientId, eventId: eventId, outcome: outcome });
+  }
+
+  function answerApproval(item, decision) {
+    item.sent = true;
+    if (S.view === 'chat') renderComposer();
+    replyEvent(item.eventId, { kind: 'result', value: decision })
+      .then(function () { removeInteractive(item.eventId); toast(decision === 'allowed-once' ? '已允许' : '已拒绝'); })
+      .catch(function (e) { item.sent = false; renderComposer(); toast('回复失败：' + e.message); });
+  }
+
+  function answerQuestions(item) {
+    var qs = item.request.questions || [];
+    var answers = qs.map(function (q) {
+      var p = item.picked[q.id] || {};
+      return { id: q.id, selected: (p.selected || []).slice(), custom: (p.custom || '') || undefined };
+    });
+    var blank = answers.every(function (a) { return !a.selected.length && !a.custom; });
+    if (blank) { toast('请先选择或填写'); return; }
+    item.sent = true;
+    if (S.view === 'chat') renderComposer();
+    replyEvent(item.eventId, { kind: 'result', value: { answers: answers } })
+      .then(function () { removeInteractive(item.eventId); toast('已提交'); })
+      .catch(function (e) { item.sent = false; renderComposer(); toast('提交失败：' + e.message); });
+  }
+
+  function toggleOption(item, q, label) {
+    var p = item.picked[q.id] || (item.picked[q.id] = { selected: [], custom: '' });
+    if (q.multiSelect) {
+      var i = p.selected.indexOf(label);
+      if (i >= 0) p.selected.splice(i, 1); else p.selected.push(label);
+    } else {
+      p.selected = p.selected[0] === label ? [] : [label];
+    }
+    renderComposer();
+  }
+
   // ─────────────────────────────────────────────────────────── sessions
   function loadSessions() {
     return rpc('session/list', { _request: {} }).then(function (v) {
@@ -369,6 +500,8 @@
       if (ev.type === 'turn/end') { cur.running = false; cur.live = null; }
       if (ev.type === 'assistant/message') cur.live = null;
       if (ev.type === 'session/title' && ev.data && ev.data.title) cur.title = ev.data.title;
+      if (ev.type === 'permission/preset' && ev.data && ev.data.preset) cur.projections.permissions = { currentValue: ev.data.preset };
+      if (ev.type === 'model/selection' && ev.data) cur.projections.modelSelection = { next: { provider: ev.data.provider, model: ev.data.model }, lastUsed: cur.projections.modelSelection && cur.projections.modelSelection.lastUsed };
       if (ev.type === 'todo/write') cur.projections.todos = ev.data.todos;
       appendRecord(cur, frame);
       renderChat(false);
@@ -623,8 +756,42 @@
     }).catch(function (e) { toast('失败：' + e.message); });
   }
 
-  function pickModel() {
-    rpc('session/modelCatalog', {}).then(function (cat) {
+  /** Switch the session's permission preset through the `/permission` command. */
+  function pickPermission() {
+    if (!S.cur) return;
+    rpc('permissionPresets/catalog', {}).then(function (cat) {
+      var current = (S.cur.projections.permissions || {}).currentValue || '';
+      var sheet = el('div', 'toast');
+      sheet.style.top = 'calc(var(--sat) + 50px)';
+      sheet.style.borderRadius = '14px'; sheet.style.padding = '6px';
+      sheet.style.textAlign = 'left'; sheet.style.width = '76vw'; sheet.style.maxWidth = '320px';
+      var html = '<div style="padding:8px 14px;color:var(--fg-faint);font-size:12px">权限预设（当前：' + esc(current || '未知') + '）</div>';
+      (cat.options || []).forEach(function (o) {
+        html += '<div data-v="' + esc(o.value) + '" style="padding:10px 14px;' + (o.value === current ? 'color:var(--accent)' : '') + '">'
+          + esc(o.name || o.value) + (o.value === current ? ' ✓' : '') + '</div>';
+      });
+      sheet.innerHTML = html;
+      document.body.appendChild(sheet);
+      var close = function () { sheet.remove(); document.removeEventListener('click', outside); };
+      var outside = function () { close(); };
+      sheet.addEventListener('click', function (ev) {
+        var d = ev.target.closest('[data-v]');
+        if (!d) return;
+        close();
+        var preset = d.dataset.v;
+        rpc('commands/execute', { agentId: S.cur.id, line: '/permission ' + preset, submittedAttachments: [] })
+          .then(function () {
+            S.cur.projections.permissions = { currentValue: preset };
+            renderComposer();
+            toast('已切换为 ' + preset);
+          })
+          .catch(function (e) { toast('切换失败：' + e.message); });
+      });
+      setTimeout(function () { document.addEventListener('click', outside); }, 0);
+    }).catch(function (e) { toast('读取预设失败：' + e.message); });
+  }
+
+  function pickModel() {    rpc('session/modelCatalog', {}).then(function (cat) {
       var sheet = el('div', 'toast');
       sheet.style.bottom = 'auto'; sheet.style.top = 'calc(var(--sat) + 50px)';
       sheet.style.borderRadius = '14px'; sheet.style.padding = '6px'; sheet.style.textAlign = 'left';
@@ -681,6 +848,9 @@
       }
     }
     updateLiveNode(S.cur);
+    // Chips (model / permission / connection) depend on projections that only
+    // exist after the snapshot, so refresh them with the conversation.
+    renderComposer();
     scrollChat(false);
   }
 
@@ -717,23 +887,24 @@
       body.innerHTML = md(item.text);
       node.appendChild(sum); node.appendChild(body);
     } else if (item.kind === 'assistant') {
-      node = el('div', 'msg assistant');
       var blocks = item.blocks || [];
       var html = '';
       var textSeen = false;
+      var reasoningSeen = false;
       blocks.forEach(function (b) {
         if (b.type === 'reasoning') {
+          reasoningSeen = true;
           html += '<details class="think"><summary>思考过程 · ' + fmtBytes(byteLen(b.text || '')) + '</summary>' + md(b.text || '') + '</details>';
         } else if (b.type === 'text') {
-          textSeen = true;
+          if ((b.text || '').trim()) textSeen = true;
           html += md(b.text || '');
-        } else if (b.type === 'tool-call') {
-          html += '';
         }
       });
-      if (!textSeen) html += '';
+      // A step that only made tool calls carries no prose — the tool card below
+      // already says what happened, so render nothing instead of an empty bubble.
+      if (!textSeen && !reasoningSeen) return;
+      node = el('div', 'msg assistant');
       node.innerHTML = html;
-      if (!node.innerHTML.trim()) { node.innerHTML = '<span style="color:var(--fg-faint)">（无文本输出）</span>'; }
     } else if (item.kind === 'tool') {
       node = toolNode(item);
     } else if (item.kind === 'tool-result') {
@@ -788,11 +959,28 @@
   }
 
   function hintOf(name, args) {
-    if (!args || typeof args !== 'object') return '';
-    var keys = ['command', 'description', 'path', 'file_path', 'pattern', 'query', 'url', 'prompt', 'text'];
-    for (var i = 0; i < keys.length; i++) if (args[keys[i]]) return truncate(String(args[keys[i]]).replace(/\s+/g, ' '), 60);
+    if (args == null) return '';
+    if (typeof args !== 'object') return truncate(String(args).replace(/\s+/g, ' '), 60);
+    var keys = ['command', 'description', 'path', 'file_path', 'pattern', 'query', 'url', 'prompt', 'text', 'questions', 'line', 'title'];
+    for (var i = 0; i < keys.length; i++) {
+      var v = args[keys[i]];
+      if (v == null || v === '') continue;
+      if (typeof v === 'string') return truncate(v.replace(/\s+/g, ' '), 60);
+      if (Array.isArray(v)) {
+        var parts = v.map(function (x) {
+          if (typeof x === 'string') return x;
+          if (x && typeof x === 'object') return x.question || x.label || x.id || JSON.stringify(x);
+          return String(x);
+        }).join(' · ');
+        return truncate(parts.replace(/\s+/g, ' '), 60);
+      }
+      if (typeof v === 'object') return truncate(JSON.stringify(v).replace(/\s+/g, ' '), 60);
+    }
     var k = Object.keys(args)[0];
-    return k ? k + '=' + truncate(String(args[k]).replace(/\s+/g, ' '), 40) : '';
+    if (!k) return '';
+    var val = args[k];
+    var s = typeof val === 'object' ? JSON.stringify(val) : String(val);
+    return k + '=' + truncate(s.replace(/\s+/g, ' '), 40);
   }
 
   function cssEsc(s) { return String(s || '').replace(/["\\]/g, '\\$&'); }
@@ -837,6 +1025,8 @@
   var composerRefs = {};
   function composer() {
     var box = el('div', 'composer');
+    var ask = el('div', 'ask-slot');
+    box.appendChild(ask);
     var chips = el('div', 'chips');
     box.appendChild(chips);
 
@@ -860,7 +1050,7 @@
     box.appendChild(line);
     box.appendChild(file);
 
-    composerRefs = { ta: ta, send: send, chips: chips, box: box };
+    composerRefs = { ta: ta, send: send, chips: chips, ask: ask, box: box };
 
     ta.addEventListener('input', function () {
       ta.style.height = 'auto';
@@ -876,6 +1066,85 @@
     });
     setTimeout(renderComposer, 0);
     return box;
+  }
+
+  /** Approval / user-question card pinned above the composer (the browser shows
+   *  the same two flows as a composer takeover). */
+  function renderAskSlot() {
+    var slot = composerRefs.ask;
+    if (!slot) return;
+    slot.innerHTML = '';
+    if (!S.cur) return;
+    // Requests are agent(session)-scoped; only show the ones for the open session.
+    var mine = S.interactive.filter(function (it) { return !it.agentId || it.agentId === S.cur.id; });
+    var item = mine[0];
+    if (!item) return;
+
+    var card = el('div', 'ask');
+    var head = el('div', 'ask-head');
+    head.appendChild(el('span', 'ask-kind', item.kind === 'approval' ? '需要批准' : '模型提问'));
+    if (item.request && item.request.toolName) head.appendChild(el('span', 'ask-tool', item.request.toolName));
+    card.appendChild(head);
+
+    if (item.kind === 'approval') {
+      var r = item.request || {};
+      var reason = r.reason || (r.displayReason && (r.displayReason.zh || r.displayReason.en)) || '';
+      if (reason) {
+        var body = el('div', 'ask-text');
+        body.textContent = reason;
+        card.appendChild(body);
+      }
+      var row = el('div', 'ask-actions');
+      var allow = el('button', 'btn', item.sent ? '处理中…' : '允许一次');
+      allow.disabled = !!item.sent;
+      allow.addEventListener('click', function () { answerApproval(item, 'allowed-once'); });
+      var deny = el('button', 'btn ghost', '拒绝');
+      deny.disabled = !!item.sent;
+      deny.addEventListener('click', function () { answerApproval(item, 'rejected'); });
+      row.appendChild(allow); row.appendChild(deny);
+      card.appendChild(row);
+    } else {
+      var qs = (item.request && item.request.questions) || [];
+      qs.forEach(function (q) {
+        var box = el('div', 'ask-q');
+        if (q.header) box.appendChild(el('div', 'ask-header', q.header));
+        box.appendChild(el('div', 'ask-text', q.question));
+        if (q.detail) box.appendChild(el('div', 'ask-detail', q.detail));
+        var picked = (item.picked[q.id] || {}).selected || [];
+        if (q.options && q.options.length) {
+          var opts = el('div', 'ask-opts');
+          q.options.forEach(function (o) {
+            var on = picked.indexOf(o.label) >= 0;
+            var b = el('button', 'opt' + (on ? ' on' : ''));
+            b.appendChild(el('span', 'opt-label', o.label));
+            if (o.description) b.appendChild(el('span', 'opt-desc', o.description));
+            b.addEventListener('click', function () { toggleOption(item, q, o.label); });
+            opts.appendChild(b);
+          });
+          box.appendChild(opts);
+        }
+        if (q.options && q.options.length && q.multiSelect) box.appendChild(el('div', 'ask-detail', '可多选'));
+        var inp = document.createElement('input');
+        inp.type = 'text';
+        inp.placeholder = q.options && q.options.length ? '其他（可填）' : '输入你的回答';
+        inp.value = item.custom[q.id] || '';
+        inp.addEventListener('input', function () {
+          item.custom[q.id] = inp.value;
+          var p = item.picked[q.id] || (item.picked[q.id] = { selected: [], custom: '' });
+          p.custom = inp.value;
+        });
+        box.appendChild(inp);
+        card.appendChild(box);
+      });
+      var row2 = el('div', 'ask-actions');
+      var submit = el('button', 'btn', item.sent ? '提交中…' : '提交回答');
+      submit.disabled = !!item.sent;
+      submit.addEventListener('click', function () { answerQuestions(item); });
+      row2.appendChild(submit);
+      if (mine.length > 1) row2.appendChild(el('span', 'ask-detail', '还有 ' + (mine.length - 1) + ' 个待处理'));
+      card.appendChild(row2);
+    }
+    slot.appendChild(card);
   }
 
   function doSend() {
@@ -912,6 +1181,7 @@
 
   function renderComposer() {
     if (!composerRefs.chips) return;
+    renderAskSlot();
     var chips = composerRefs.chips;
     chips.innerHTML = '';
     var cur = S.cur;
@@ -923,7 +1193,11 @@
       chips.appendChild(c);
     }
     var perms = cur && cur.projections && cur.projections.permissions;
-    if (perms && perms.currentValue) chips.appendChild(el('span', 'chip', perms.currentValue));
+    if (perms && perms.currentValue) {
+      var pc = el('span', 'chip', perms.currentValue);
+      pc.addEventListener('click', pickPermission);
+      chips.appendChild(pc);
+    }
     if (S.muxReady) chips.appendChild(el('span', 'chip run', '● 已连接'));
     else chips.appendChild(el('span', 'chip', '连接中…'));
     S.pending.forEach(function (p, i) {
@@ -1082,7 +1356,11 @@
   function resetMux() {
     if (S.mux) { S.mux.closed = true; try { S.mux.ws && S.mux.ws.close(); } catch (e) {} S.mux = null; }
     S.muxReady = false;
+    S.forwardId = null;
+    S.clientId = '';
+    S.interactive = [];
     mux();
+    attachForwardedEvents();
   }
 
   /** Android back button: chat → list → settings → exit. */
@@ -1118,20 +1396,28 @@
     S.view = 'sessions';
     render();
     mux();
+    attachForwardedEvents();
     loadSessions().catch(function (e) {
       if (e.code === 'unauthenticated') showLogin();
       else { S.lastError = '连不上服务器：' + e.message; render(); }
     });
+    // The $events stream keeps the list live; this slow poll is only a safety net.
     setInterval(function () {
       if (S.view === 'sessions' && document.visibilityState === 'visible') loadSessions().catch(function () {});
-    }, 6000);
+    }, 30000);
   }
 
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'visible' && S.view === 'sessions') loadSessions().catch(function () {});
   });
 
-  window.__DSHM__ = { state: S, rpc: rpc, md: md, login: login, back: goBack };
+  window.__DSHM__ = {
+    state: S, rpc: rpc, md: md, login: login, back: goBack,
+    // test hooks (used by test/harness*.mjs)
+    open: function (id, title) { openSession(id, title); },
+    send: function (text) { return sendPrompt(text, []); },
+    list: function () { return loadSessions(); }
+  };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
