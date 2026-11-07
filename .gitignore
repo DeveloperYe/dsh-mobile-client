@@ -8,3 +8,4 @@ build/
 local.properties
 tools/
 
+dist/

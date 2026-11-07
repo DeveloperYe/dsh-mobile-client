@@ -190,6 +190,9 @@
     clientId: '',         // $events stream generation id (required for every reply)
     forwardId: null,      // $events stream handle
     interactive: [],      // unanswered approval / user-question requests
+    searchOpen: false,
+    query: '',
+    searchHits: [],
   };
 
   function saveCache() {
@@ -632,26 +635,60 @@
   function renderSessions() {
     var wrap = document.createDocumentFragment();
     wrap.appendChild(header('DSH', S.sessions.length ? S.sessions.length + ' 个会话' : '连接中…', [
-      { icon: '＋', label: '新会话', on: newSession },
-      { icon: '⚙', label: '设置', on: function () { S.view = 'settings'; render(); } }
+      { icon: 'search', label: '搜索', on: toggleSearch },
+      { icon: 'plus', label: '新会话', on: newSession },
+      { icon: 'gear', label: '设置', on: function () { S.view = 'settings'; render(); } }
     ]));
 
+    if (S.searchOpen) {
+      var bar = el('div', 'searchbar');
+      var inp = document.createElement('input');
+      inp.type = 'search';
+      inp.placeholder = '搜索标题，或按内容搜（≥2 字）';
+      inp.value = S.query || '';
+      var t = null;
+      inp.addEventListener('input', function () {
+        S.query = inp.value;
+        clearTimeout(t);
+        t = setTimeout(function () { runSearch(); }, 260);
+      });
+      bar.appendChild(inp);
+      wrap.appendChild(bar);
+    }
+
     var sc = el('div', 'scroll');
-    if (!S.sessions.length) {
+    var rows = visibleSessions();
+    if (!rows.length) {
       var e = el('div', 'empty');
-      e.innerHTML = S.lastError ? esc(S.lastError) : '<span class="spin-sm"></span>&nbsp; 正在读取会话…';
+      if (S.query) e.textContent = '没有匹配的会话';
+      else e.innerHTML = S.lastError ? esc(S.lastError) : '<span class="spin-sm"></span>&nbsp; 正在读取会话…';
       sc.appendChild(e);
     }
     var lastCwd = null;
-    S.sessions.forEach(function (s) {
+    rows.forEach(function (s) {
       var cwd = s.cwd || '(未知工作区)';
-      if (cwd !== lastCwd) {
+      if (cwd !== lastCwd && !S.query) {
         lastCwd = cwd;
         sc.appendChild(el('div', 'group-label', baseName(cwd) || cwd));
       }
       sc.appendChild(sessionRow(s));
     });
-    // pull-to-refresh-ish: refresh when scrolled to top
+    if (S.searchHits && S.searchHits.length) {
+      sc.appendChild(el('div', 'group-label', '内容命中'));
+      S.searchHits.forEach(function (hit) {
+        var s = byId(hit.sessionId);
+        var row = el('div', 'row');
+        row.dataset.id = hit.sessionId;
+        var g = el('div', 'grow');
+        g.appendChild(el('div', 't', (s && s.projections && s.projections.values && s.projections.values.title) || hit.sessionId));
+        var m = el('div', 'm');
+        m.appendChild(el('span', 'snip', String(hit.snippet || '').replace(/\s+/g, ' ')));
+        g.appendChild(m);
+        row.appendChild(g);
+        row.addEventListener('click', function () { openSession(hit.sessionId, ''); });
+        sc.appendChild(row);
+      });
+    }
     sc.addEventListener('scroll', function () {
       if (sc.scrollTop <= 0 && Date.now() - (renderSessions._last || 0) > 4000) {
         renderSessions._last = Date.now();
@@ -660,6 +697,32 @@
     });
     wrap.appendChild(sc);
     mount(wrap);
+  }
+
+  function visibleSessions() {
+    var q = (S.query || '').trim().toLowerCase();
+    if (!q) return S.sessions;
+    return S.sessions.filter(function (s) {
+      var title = (s.projections && s.projections.values && (s.projections.values.title || '')) || '';
+      return title.toLowerCase().indexOf(q) >= 0 || (s.cwd || '').toLowerCase().indexOf(q) >= 0;
+    });
+  }
+
+  function toggleSearch() {
+    S.searchOpen = !S.searchOpen;
+    if (!S.searchOpen) { S.query = ''; S.searchHits = []; }
+    render();
+    if (S.searchOpen) { var i = document.querySelector('.searchbar input'); i && i.focus(); }
+  }
+
+  /** Title filtering is instant; content search asks the host (session/search). */
+  function runSearch() {
+    var q = (S.query || '').trim();
+    if (q.length < 2) { S.searchHits = []; render(); return; }
+    rpc('session/search', { request: { query: q } }).then(function (v) {
+      S.searchHits = (v && v.items) || [];
+      render();
+    }).catch(function () { render(); });
   }
 
   function sessionRow(s) {
@@ -682,12 +745,7 @@
   }
 
   function newSession() {
-    var cwd = S.cwd || (S.sessions[0] && S.sessions[0].cwd) || '';
-    if (!cwd) { toast('请先在设置里填写默认工作目录'); S.view = 'settings'; render(); return; }
-    toast('正在新建…');
-    rpc('session/create', { request: { cwd: cwd } }).then(function (v) {
-      return loadSessions().then(function () { openSession(v.sessionId, '（新会话）'); });
-    }).catch(function (e) { toast('新建失败：' + e.message); });
+    pickCwd();
   }
 
   // ---------- chat
@@ -698,15 +756,20 @@
     var cur = S.cur;
     var frag = document.createDocumentFragment();
     var title = cur.projections.title || cur.title || '会话';
-    frag.appendChild(header(title, (cur.header && baseName(cur.header.cwd)) || '', [
-      { icon: '←', label: '返回', on: function () { leaveChat(); } },
-      { icon: '⋯', label: '菜单', on: function () { chatMenu(); } }
+    frag.appendChild(header(title, '', [
+      { icon: 'back', label: '返回', on: function () { leaveChat(); } },
+      { icon: 'more', label: '菜单', on: function () { chatMenu(); } }
     ]));
+    var st = statsText(cur);
+    var line = el('div', 'statline', st);
+    if (!st) line.style.display = 'none';
+    frag.appendChild(line);
     var log = el('div', 'scroll log');
     frag.appendChild(log);
     frag.appendChild(composer());
     mount(frag);
     chatRefs.log = log;
+    chatRefs.statline = line;
     renderedCount = 0;
     renderChat(true);
   }
@@ -722,6 +785,7 @@
   function chatMenu() {
     var cur = S.cur;
     var items = [];
+    items.push(['命令面板', commandPalette]);
     items.push(['选择模型', pickModel]);
     items.push(['重命名会话', renameCur]);
     items.push(['复制会话 ID', function () { copy(cur.id); }]);
@@ -848,8 +912,12 @@
       }
     }
     updateLiveNode(S.cur);
-    // Chips (model / permission / connection) depend on projections that only
-    // exist after the snapshot, so refresh them with the conversation.
+    // Projections only exist after the snapshot: fill the stats line and chips now.
+    if (chatRefs.statline) {
+      var stText = statsText(S.cur);
+      chatRefs.statline.textContent = stText + (S.cur.projections.agentPreset ? ' · ' + S.cur.projections.agentPreset : '');
+      chatRefs.statline.style.display = stText ? '' : 'none';
+    }
     renderComposer();
     scrollChat(false);
   }
@@ -874,6 +942,7 @@
     if (item.kind === 'user') {
       node = el('div', 'msg user');
       node.innerHTML = md(item.text);
+      attachLongPress(node, function () { msgActions(item); });
     } else if (item.kind === 'inject') {
       if (!item.text) return;
       node = document.createElement('details');
@@ -1043,7 +1112,7 @@
     send.type = 'button';
 
     var plus = el('button', 'iconbtn');
-    plus.textContent = '＋';
+    plus.appendChild(icon('plus', 20));
     plus.addEventListener('click', function () { file.click(); });
 
     line.appendChild(plus); line.appendChild(ta); line.appendChild(send);
@@ -1209,16 +1278,180 @@
     var send = composerRefs.send;
     if (cur && cur.running) {
       send.classList.add('stop');
-      send.textContent = '■';
+      send.innerHTML = '';
+      send.appendChild(icon('stop', 18));
       send.disabled = false;
     } else {
       send.classList.remove('stop');
-      send.textContent = '↑';
+      send.innerHTML = '';
+      send.appendChild(icon('send', 19));
       send.disabled = !(ta && ta.value.trim()) && !S.pending.length;
     }
   }
 
   // ---------- header helper
+  // ---------- small UI kit: inline icons + bottom sheet
+  var ICONS = {
+    back: 'M15 5l-7 7 7 7',
+    more: 'M6 12h.01M12 12h.01M18 12h.01',
+    plus: 'M12 5v14M5 12h14',
+    gear: 'M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v.0a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15z',
+    search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3',
+    send: 'M12 19V5M5 12l7-7 7 7',
+    stop: 'M7 7h10v10H7z',
+    terminal: 'M4 5h16v14H4zM8 10l2.5 2L8 14m5 0h4',
+    file: 'M14 3v5h5M6 3h9l4 4v14H6z',
+    chart: 'M4 20V10M10 20V4M16 20v-7M22 20H2',
+    command: 'M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z'
+  };
+  function icon(name, size) {
+    var p = ICONS[name] || '';
+    var n = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    n.setAttribute('viewBox', '0 0 24 24');
+    n.setAttribute('width', size || 20); n.setAttribute('height', size || 20);
+    n.setAttribute('fill', 'none'); n.setAttribute('stroke', 'currentColor');
+    n.setAttribute('stroke-width', '1.8'); n.setAttribute('stroke-linecap', 'round');
+    n.setAttribute('stroke-linejoin', 'round');
+    var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', p);
+    n.appendChild(path);
+    return n;
+  }
+
+  /** Bottom sheet. `build(body, close)` fills the body; returns a closer. */
+  function sheet(title, build) {
+    var back = el('div', 'sheet-back');
+    var box = el('div', 'sheet');
+    var grab = el('div', 'sheet-grab');
+    box.appendChild(grab);
+    if (title) box.appendChild(el('div', 'sheet-title', title));
+    var body = el('div', 'sheet-body');
+    box.appendChild(body);
+    back.appendChild(box);
+    var close = function () {
+      back.classList.add('out');
+      setTimeout(function () { back.remove(); }, 160);
+    };
+    back.addEventListener('click', function (ev) { if (ev.target === back) close(); });
+    document.body.appendChild(back);
+    requestAnimationFrame(function () { back.classList.add('in'); });
+    build(body, close);
+    return close;
+  }
+  function sheetRow(label, desc, onClick, opts) {
+    var r = el('div', 'sheet-row');
+    var t = el('div', 'sheet-row-main');
+    t.appendChild(el('div', 'sheet-row-label', label));
+    if (desc) t.appendChild(el('div', 'sheet-row-desc', desc));
+    r.appendChild(t);
+    if (opts && opts.active) r.appendChild(el('span', 'sheet-check', '✓'));
+    r.addEventListener('click', onClick);
+    return r;
+  }
+
+  /** Compact token/time summary for the open session. */
+  function statsText(cur) {
+    var p = (cur && cur.projections) || {};
+    var u = p.tokenUsage || {};
+    var s = p.sessionStats || {};
+    var bits = [];
+    if (u.cacheReadTokens || u.uncachedInputTokens) {
+      var inTok = (u.uncachedInputTokens || 0) + (u.cacheReadTokens || 0);
+      bits.push((inTok >= 1000 ? Math.round(inTok / 1000) + 'k' : inTok) + ' in');
+    }
+    if (u.outputTokens) bits.push((u.outputTokens >= 1000 ? (u.outputTokens / 1000).toFixed(1) + 'k' : u.outputTokens) + ' out');
+    if (s.steps) bits.push(s.steps + ' 步');
+    if (s.llmMs) bits.push('LLM ' + Math.round(s.llmMs / 1000) + 's');
+    var cp = p.contextPressure || {};
+    if (cp.contextWindow) bits.push(Math.round((cp.pressureTokens || 0) / cp.contextWindow * 100) + '% ctx');
+    return bits.join(' · ');
+  }
+
+  /** Slash-command palette: /compact, /permission, /goal, /export … */
+  function commandPalette() {
+    if (!S.cur) return;
+    rpc('commands/list', { agentId: S.cur.id }).then(function (list) {
+      sheet('命令', function (body, close) {
+        (list || []).forEach(function (c) {
+          body.appendChild(sheetRow('/' + c.name, c.description, function () {
+            close();
+            var hint = (c.input && c.input.hint) || '';
+            var arg = hint ? prompt('/' + c.name + '  ' + hint, '') : null;
+            if (hint && arg === null) return;
+            rpc('commands/execute', { agentId: S.cur.id, line: '/' + c.name + (arg ? ' ' + arg : ''), submittedAttachments: [] })
+              .then(function () { toast('/' + c.name + ' 已执行'); })
+              .catch(function (e) { toast('执行失败：' + e.message); });
+          }));
+        });
+        body.appendChild(sheetRow('取消', '', close));
+      });
+    }).catch(function (e) { toast('读取命令失败：' + e.message); });
+  }
+
+  /** New-session workspace picker: recent cwds plus a manual entry. */
+  function pickCwd() {
+    var seen = {}, list = [];
+    S.sessions.forEach(function (s) { if (s.cwd && !seen[s.cwd]) { seen[s.cwd] = 1; list.push(s.cwd); } });
+    sheet('新建会话', function (body, close) {
+      body.appendChild(el('div', 'sheet-note', '选一个工作目录（服务器上的路径）'));
+      list.slice(0, 8).forEach(function (cwd) {
+        body.appendChild(sheetRow(baseName(cwd) || cwd, cwd, function () { close(); createSessionIn(cwd); }));
+      });
+      var custom = sheetRow('其他目录…', '手动输入完整路径', function () {
+        var p = prompt('工作目录（服务器路径）', S.cwd || list[0] || '');
+        if (!p) return;
+        close(); createSessionIn(p);
+      });
+      body.appendChild(custom);
+    });
+  }
+
+  function createSessionIn(cwd) {
+    toast('正在新建…');
+    rpc('session/create', { request: { cwd: cwd } }).then(function (v) {
+      S.cwd = cwd; lsSet(K.cwd, cwd);
+      return loadSessions().then(function () { openSession(v.sessionId, '（新会话）'); });
+    }).catch(function (e) { toast('新建失败：' + e.message); });
+  }
+
+  /** Long-press actions for one user message: copy / resend / fork from here. */
+  function msgActions(item, close) {
+    close && close();
+    sheet('消息', function (body, c) {
+      body.appendChild(sheetRow('复制', '', function () {
+        c();
+        try { navigator.clipboard.writeText(item.text || ''); toast('已复制'); } catch (e) { toast('复制失败'); }
+      }));
+      body.appendChild(sheetRow('重新发送', '把这条内容再发一次', function () {
+        c();
+        sendPrompt(item.text || '', []).catch(function (e) { toast('失败：' + e.message); });
+      }));
+      body.appendChild(sheetRow('从此处分叉会话', '以这条消息为界新建一个分支', function () {
+        c();
+        rpc('session/fork', { request: { sessionId: S.cur.id, atSeq: item.seq } })
+          .then(function (v) { toast('已分叉'); loadSessions().then(function () { openSession(v.sessionId, '（分叉）'); }); })
+          .catch(function (e) { toast('分叉失败：' + e.message); });
+      }));
+    });
+  }
+
+  /** Long-press (or right-click) hook for message actions. */
+  function attachLongPress(node, fn) {
+    var timer = null, moved = false;
+    node.addEventListener('touchstart', function () {
+      moved = false;
+      timer = setTimeout(function () {
+        if (moved) return;
+        try { if (navigator.vibrate) navigator.vibrate(12); } catch (e) {}
+        fn();
+      }, 480);
+    }, { passive: true });
+    node.addEventListener('touchmove', function () { moved = true; clearTimeout(timer); }, { passive: true });
+    node.addEventListener('touchend', function () { clearTimeout(timer); }, { passive: true });
+    node.addEventListener('touchcancel', function () { clearTimeout(timer); }, { passive: true });
+    node.addEventListener('contextmenu', function (ev) { ev.preventDefault(); fn(); });
+  }
+
   function header(title, sub, actions) {
     var h = el('div', 'hdr');
     var t = el('h1');
@@ -1227,8 +1460,9 @@
     h.appendChild(t);
     (actions || []).forEach(function (a) {
       var b = el('button', 'iconbtn');
-      b.textContent = a.icon;
       b.setAttribute('aria-label', a.label);
+      if (ICONS[a.icon]) b.appendChild(icon(a.icon, 19));
+      else b.textContent = a.icon;
       b.addEventListener('click', a.on);
       h.appendChild(b);
     });
@@ -1422,4 +1656,5 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
 })();
+
 
