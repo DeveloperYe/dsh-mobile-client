@@ -12,15 +12,16 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.7.0 | **定时任务面板**（本会话 / 全部会话两种范围、规则与下次触发、详情、删除）+ **工作区管理**（`workspace/follow` 订阅、置顶、归档箱恢复、改名、登记/删除、按工区看会话、会话长按菜单、主列表隐藏已归档） |
 | 1.6.0 | **终端**：xterm 6.0.0（与宿主同版本，从 GUI 包里抽出内置）+ `terminal/*` 全套；多 shell、键栏、自适应尺寸、重开复用同一进程、明暗跟随 |
 
 ## 剩余工作
 
-1. ~~终端面板~~ ✅ 1.6.0 完成
-2. **定时任务**（`schedule/list` 的请求体形状未确认）
-3. **工作区管理**（改名/归档/置顶；`WorkspaceRenameRequest` 等字段未确认）
-4. **设置写操作**（改凭据 `credentials/set`、`settings/mutate`、插件开关）
-5. UI 细活：长按会话出操作菜单、面板转场动效
+1. ~~终端面板~~ ✅ 1.6.0
+2. ~~定时任务面板~~ ✅ 1.7.0（只能查看/删除；任务由模型用 `schedule_create` 建，RPC 层没有 create）
+3. ~~工作区管理~~ ✅ 1.7.0（置顶/归档/改名/登记/删除/排序接口已确认，排序 UI 未做）
+4. **设置写操作**（改凭据 `credentials/set`、`settings/mutate`、插件开关；目前只读）
+5. UI 细活：面板转场动效、归档箱分页（27 条一次全画）
 
 ## 已核实的协议事实（避免重复踩坑）
 
@@ -96,6 +97,36 @@ close(agentId,id) | rename(agentId,id,title)
 - 不持有（`retain`）时，空闲 **2 小时**（`unattendedTimeoutMs`）会被回收；每会话最多 **8** 个终端。
 - 退出浮层**不结束进程**：重进会用 list 里同一个 id 重新 attach，snapshot 把历史屏幕补回来。
 
+### `schedule/*` 与 `workspace/*`（2026-11-07 实测）
+
+**最大的坑：这些方法只有一个名为 `request` 的参数，args 必须写成 `{request:{...}}`**，
+平铺字段会报 `args fields do not match the descriptor: missing "request"; unexpected "<field>"`。
+（`terminal/*`、`commands/execute`、`goals/get` 相反：那些是多个具名参数，平铺才对。）
+
+```
+schedule/catalog()                                  -> ScheduleCatalogEntry[]（全机）
+schedule/list({sessionId})                          -> ScheduleRecord[]（按 kind 区分的联合）
+schedule/delete({sessionId, id})                    -> {id, deleted:boolean}
+schedule/update({sessionId, id, expected, title?, prompt?, change?})  // expected=整条旧记录，做 CAS
+schedule/history({sessionId, id, limit, before?})   -> 投递记录
+workspace/follow 流                                 -> {type:'baseline', value:{items, archivedSessionIds, pinnedSessionIds}}
+                                                       + upsert / remove / order / archived / pinned 增量
+workspace/create({path}) | rename({workspaceId,title}) | delete({workspaceId})
+workspace/pinSession({sessionId}) | unpinSession({sessionId}) -> {pinnedSessionIds}
+workspace/archiveSession({sessionId, stopActivity?}) | unarchiveSession({sessionId}) -> {archivedSessionIds}
+workspace/insertBefore | insertSessionBefore        -> 排序（UI 未做）
+directoryPicker/list({path?})                       -> DirectoryListing
+```
+
+- 工作区**只能通过 `workspace/follow` 流读取**，没有普通 list；客户端要一直持有这条流
+  （置顶/归档集合也只在流里，靠它才能把已归档会话从主列表收起）。
+- `archiveSession` 对**有活动**（回合、子代理、后台任务、活跃定时任务）的会话会拒绝并回
+  `workspace/session-active` + `activity` 列表；要强推得传 `stopActivity:true`（不等待停止）。
+- 定时任务**没有 create 类 RPC**——任务由模型的 `schedule_create` 工具建；客户端只能 list/delete/update。
+- `ScheduleRecord` 是判别联合：`after`(afterSeconds) / `at` / `every`(everySeconds) / `daily`(time,timeZone) /
+  `weekly`(time,timeZone,weekdays) / `cron`(expression,timeZone)，都带 `title`、`prompt`、`scheduledAt`。
+  `schedule/catalog()` 的条目额外带 `sessionId`、`status`、`lastDelivery?`。
+
 ### 踩过的坑（都值得保留）
 
 1. **明文 HTTP 下没有 `crypto.randomUUID`**（secure context 限制），需自备 polyfill；`crypto.getRandomValues` 可用。
@@ -119,6 +150,9 @@ test/harness-traj.mjs 轨迹面板
 test/harness-info.mjs 会话信息面板
 test/probe-term.mjs   终端协议裸探针（一元 + 流，逐帧打印）
 test/harness-term.mjs 终端面板：连接/输入/键盘/尺寸/重开复用/主题，10 项断言
+test/probe-sched-ws.mjs    定时任务/工作区协议探针（含 request 包装验证）
+test/harness-sched-ws.mjs  定时任务 + 工作区：15 项断言（--skip-agent 跳过让模型建任务的慢路径）
+test/cleanup-harness-sessions.mjs 归档测试里新建的临时会话
 test/measure.mjs      冷/热启动首帧耗时
 ```
 
