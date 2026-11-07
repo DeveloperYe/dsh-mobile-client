@@ -1000,7 +1000,7 @@
       if (applyServerToShell()) return;   // native shell reloads at the new origin
       login(S.server, S.pass).then(function () {
         S.view = 'sessions';
-        if (S.mux) { S.mux.closed = true; S.mux = null; }
+        resetMux();
         loadSessions().catch(function (e) { err.hidden = false; err.textContent = e.message; });
         render();
       }).catch(function (e) {
@@ -1058,7 +1058,7 @@
       S.pass = pass.value; lsSet(K.pass, S.pass);
       go.disabled = true; go.textContent = '登录中…';
       login(S.server, S.pass).then(function () {
-        S.view = 'sessions'; if (S.mux) { S.mux.closed = true; S.mux = null; }
+        S.view = 'sessions'; resetMux();
         loadSessions(); render();
       }).catch(function (e) { go.disabled = false; go.textContent = '登录'; err.hidden = false; err.textContent = e.message; });
     });
@@ -1076,6 +1076,13 @@
     if (S.view === 'login' || S.view === 'setup') return;
     if (S.cur && S.cur.followId && S.mux) S.mux.closeStream(S.cur.followId);
     S.cur = null; S.view = 'login'; render();
+  }
+
+  /** After a successful login, drop the unauthenticated mux and reconnect. */
+  function resetMux() {
+    if (S.mux) { S.mux.closed = true; try { S.mux.ws && S.mux.ws.close(); } catch (e) {} S.mux = null; }
+    S.muxReady = false;
+    mux();
   }
 
   /** Android back button: chat → list → settings → exit. */
@@ -1129,3 +1136,4 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
 })();
+
