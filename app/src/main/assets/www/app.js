@@ -200,6 +200,8 @@
     term: null,
     sched: null,
     ws: null,
+    settings: null,
+    skills: null,
   };
 
   function saveCache() {
@@ -642,6 +644,7 @@
     if (S.view === 'trajectory') return renderTrajectory();
     if (S.view === 'info') return renderInfo();
     if (S.view === 'sched') return renderSchedule();
+    if (S.view === 'skills') return renderSkills();
     if (S.view === 'workspace') return renderWorkspace();
     if (S.view === 'chat' && S.cur) return renderChatView();
     return renderSessions();
@@ -828,6 +831,7 @@
     items.push(['工作区（置顶/归档）', function () { openPanel('workspace'); }]);
     items.push(['会话信息（计划/待办/交付物）', function () { openPanel('info'); }]);
     items.push(['轨迹', function () { openPanel('trajectory'); }]);
+    items.push(['技能', function () { openPanel('skills'); }]);
     items.push(['命令面板', commandPalette]);
     items.push(['选择模型', pickModel]);
     items.push(['重命名会话', renameCur]);
@@ -1661,6 +1665,7 @@
     if (kind === 'goal') S.goal = null;
     if (kind === 'sched' && !S.sched) S.sched = { scope: S.cur ? 'session' : 'all', items: null, error: '', loading: false };
     if (kind === 'workspace') wsEnsure();
+    if (kind === 'skills') S.skills = null;
     render();
   }
 
@@ -2713,38 +2718,345 @@
   }
 
   // ---------- settings (extra: providers / plugins, read-only)
+  // ---------- settings (writable) — the "更多设置" entry from the settings screen
+  //
+  // Verified 2026-11-07 (dsh 0.2.0-rc.2):
+  //   settings/describe()                       -> {writable, hasDocument, namespaces:[...]}
+  //     namespace = {ns, schema, value, base?, user?, applies, secrets:[{path,set}], revision}
+  //   settings/mutate(ns, ops, expectedRevision) ops = [{op:'set',path,value}|{op:'unset',path}]
+  //     expectedRevision may be omitted; a stale one is refused (revision unchanged)
+  //   credentials/describe(refs) -> {ref:{configured, source, writable}}
+  //   credentials/set(ref, value) | credentials/unset(ref)
+  // Credential refs are the `apiKeyEnv` names declared inside the namespace values.
+  function collectCredRefs(nss) {
+    var seen = {}, rows = [];
+    function walk(o, label, ns, depth) {
+      if (!o || typeof o !== 'object' || Array.isArray(o) || depth > 3) return;
+      Object.keys(o).forEach(function (k) {
+        var v = o[k];
+        if (k === 'apiKeyEnv' && typeof v === 'string') {
+          if (!seen[v]) { seen[v] = 1; rows.push({ ref: v, label: label || v, ns: ns }); }
+          return;
+        }
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          walk(v, (typeof v.displayName === 'string' && v.displayName) || label || '', ns, depth + 1);
+        }
+      });
+    }
+    (nss || []).forEach(function (n) { walk(n.value, '', n.ns, 0); });
+    return rows;
+  }
+
+  /** Flat editable scalars of one namespace value; arrays and deep objects are skipped. */
+  function settingsLeaves(o, path, out, depth) {
+    out = out || [];
+    depth = depth || 0;
+    if (!o || typeof o !== 'object' || Array.isArray(o) || depth > 2) return out;
+    Object.keys(o).forEach(function (k) {
+      var v = o[k], p = path ? path.concat([k]) : [k];
+      if (v === null || v === undefined) return;
+      var t = typeof v;
+      if (t === 'string' || t === 'number' || t === 'boolean') out.push({ path: p, value: v });
+      else if (t === 'object' && !Array.isArray(v)) settingsLeaves(v, p, out, depth + 1);
+    });
+    return out;
+  }
+
+  /** A masked single-field prompt; `prompt()` would echo the key on screen. */
+  function secretPrompt(title, note, onSave) {
+    sheet(title, function (body, close) {
+      if (note) body.appendChild(el('div', 'sheet-note', note));
+      var inp = document.createElement('input');
+      inp.type = 'password';
+      inp.className = 'terminput';
+      inp.style.width = '100%';
+      inp.setAttribute('autocomplete', 'off');
+      inp.placeholder = '粘贴密钥后点保存';
+      body.appendChild(inp);
+      var btn = el('button', 'kbtn primary', '保存');
+      btn.style.marginTop = '10px';
+      btn.style.width = '100%';
+      btn.addEventListener('click', function () {
+        var v = inp.value.trim();
+        if (!v) { toast('不能为空'); return; }
+        close();
+        onSave(v);
+      });
+      body.appendChild(btn);
+      setTimeout(function () { try { inp.focus(); } catch (e) {} }, 60);
+    });
+  }
+
+  function settingsReload() {
+    S.settings = null;
+    renderMore();
+  }
+
   function renderMore() {
+    var st = S.settings;
     var frag = document.createDocumentFragment();
-    frag.appendChild(panelHeader('更多设置'));
+    frag.appendChild(panelHeader('设置', [
+      { icon: 'refresh', label: '重新读取', on: settingsReload }
+    ]));
     var sc = el('div', 'scroll');
     var box = el('div', 'pane');
     sc.appendChild(box);
     frag.appendChild(sc);
     mount(frag);
-    box.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 读取中…'));
-    Promise.all([
-      rpc('llm/listProviders', {}).catch(function (e) { return { error: e.message }; }),
-      rpc('pluginInventory/list', {}).catch(function (e) { return { error: e.message }; })
-    ]).then(function (res) {
-      box.innerHTML = '';
-      var prov = res[0], plug = res[1];
-      var h = '<h2>模型供应商</h2>';
-      var list = (prov && (prov.providers || prov.items)) || [];
-      if (prov && prov.error) h += '<div class="hint">读取失败：' + esc(prov.error) + '</div>';
-      else if (!list.length) h += '<div class="hint">' + esc(JSON.stringify(prov).slice(0, 400)) + '</div>';
-      else h += list.map(function (p) {
-        return '<div class="row"><div class="grow"><div class="t">' + esc(p.name || p.id) + '</div>'
-          + '<div class="m"><span>' + esc(p.id || '') + '</span></div></div></div>';
-      }).join('');
-      h += '<h2>已装插件</h2>';
-      var plugins = (plug && (plug.plugins || plug.items)) || [];
-      if (plug && plug.error) h += '<div class="hint">读取失败：' + esc(plug.error) + '</div>';
-      else if (!plugins.length) h += '<div class="hint">' + esc(JSON.stringify(plug).slice(0, 400)) + '</div>';
-      else h += plugins.slice(0, 40).map(function (p) {
-        return '<div class="row"><div class="grow"><div class="t">' + esc(p.name || p.id) + '</div>'
-          + '<div class="m"><span>' + esc([p.version, p.enabled === false ? '已禁用' : ''].filter(Boolean).join(' · ')) + '</span></div></div></div>';
-      }).join('');
-      box.innerHTML = h;
+
+    if (!st || st.loading) {
+      if (!st) S.settings = { doc: null, plugins: null, creds: null, error: '', loading: true };
+      S.settings.loading = true;
+      box.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 读取配置…'));
+      Promise.all([
+        rpc('settings/describe', {}),
+        rpc('pluginManager/listPlugins', {}).catch(function (e) { return { error: e.message }; })
+      ]).then(function (res) {
+        var doc = res[0], plug = res[1];
+        var refs = collectCredRefs(doc.namespaces);
+        return rpc('credentials/describe', { refs: refs.map(function (r) { return r.ref; }) }).then(function (desc) {
+          S.settings = {
+            doc: doc,
+            plugins: Array.isArray(plug) ? plug : ((plug && (plug.plugins || plug.items || plug.entries)) || []),
+            creds: refs.map(function (r) {
+              var d = desc && desc[r.ref];
+              return { ref: r.ref, label: r.label, ns: r.ns, configured: !!(d && d.configured), source: (d && d.source) || '', writable: !(d && d.writable === false) };
+            }),
+            error: '',
+            loading: false
+          };
+          if (S.view === 'more') renderMore();
+        });
+      }).catch(function (e) {
+        S.settings = { doc: null, plugins: null, creds: null, error: '读取配置失败：' + e.message, loading: false };
+        if (S.view === 'more') renderMore();
+      });
+      return;
+    }
+
+    box.innerHTML = '';
+    var doc = st.doc;
+    if (st.error) box.appendChild(el('div', 'hint', st.error));
+    var h = '<h2>运行配置</h2>';
+    h += '<div class="hint">' + (doc.writable ? '本机配置可写' : '配置只读（profile 不接受写入）')
+      + ' · ' + doc.namespaces.length + ' 个配置项 · ' + (st.plugins || []).length + ' 个插件</div>';
+    box.innerHTML = h;
+
+    var credBox = el('div', 'pane');
+    credBox.innerHTML = '<h2>凭据（API Key）</h2>';
+    (st.creds || []).forEach(function (c) {
+      var row = el('div', 'row');
+      row.appendChild(el('div', 'dot ' + (c.configured ? 'run' : 'idle')));
+      var g = el('div', 'grow');
+      g.appendChild(el('div', 't', c.label || c.ref));
+      var m = el('div', 'm');
+      m.appendChild(el('span', null, c.ref + ' · ' + (c.configured ? '已设置' : '未设置') + (c.source ? ' · ' + c.source : '')));
+      g.appendChild(m);
+      row.appendChild(g);
+      row.addEventListener('click', function () { credSheet(c); });
+      credBox.appendChild(row);
+    });
+    if (!(st.creds || []).length) credBox.appendChild(el('div', 'hint', '这台机器的配置里没有声明 apiKeyEnv 的凭据'));
+    box.appendChild(credBox);
+
+    var nsBox = el('div', 'pane');
+    nsBox.innerHTML = '<h2>配置项</h2>';
+    doc.namespaces.forEach(function (n) {
+      var row = el('div', 'row');
+      row.appendChild(el('div', 'dot idle'));
+      var g = el('div', 'grow');
+      g.appendChild(el('div', 't', n.ns));
+      var m = el('div', 'm');
+      var bits = ['rev ' + n.revision];
+      var uk = n.user ? Object.keys(n.user).length : 0;
+      if (uk) bits.push(uk + ' 项用户覆盖');
+      if ((n.secrets || []).length) bits.push((n.secrets || []).length + ' 个秘密槽');
+      m.appendChild(el('span', null, bits.join(' · ')));
+      g.appendChild(m);
+      row.appendChild(g);
+      row.addEventListener('click', function () { nsDetail(n.ns); });
+      nsBox.appendChild(row);
+    });
+    box.appendChild(nsBox);
+
+    var plugBox = el('div', 'pane');
+    plugBox.innerHTML = '<h2>已装插件</h2>';
+    if (!(st.plugins || []).length) plugBox.appendChild(el('div', 'hint', '插件清单为空（pluginManager 未启用？）'));
+    (st.plugins || []).slice(0, 80).forEach(function (p) {
+      var row = el('div', 'row');
+      row.appendChild(el('div', 'dot ' + (p.enabled === false ? 'idle' : 'run')));
+      var g = el('div', 'grow');
+      var title = (p.meta && p.meta.title) || p.entryId || p.moduleName;
+      g.appendChild(el('div', 't', title));
+      var m = el('div', 'm');
+      var bits = [p.enabled === false ? '已禁用' : '启用中'];
+      if (p.moduleName) bits.push(p.moduleName);
+      if (p.readOnlyReason) bits.push('不可改（' + p.readOnlyReason + '）');
+      m.appendChild(el('span', null, bits.join(' · ')));
+      g.appendChild(m);
+      row.appendChild(g);
+      row.addEventListener('click', function () { pluginSheet(p); });
+      plugBox.appendChild(row);
+    });
+    box.appendChild(plugBox);
+  }
+
+  function credSheet(c) {
+    sheet(c.label || c.ref, function (body, close) {
+      body.appendChild(el('div', 'sheet-note', c.ref + (c.source ? ' · 来源：' + c.source : '') + (c.ns ? ' · 配置项 ' + c.ns : '')));
+      if (!c.writable) {
+        body.appendChild(el('div', 'hint', '这个凭据由环境变量提供，不能在这里改'));
+        return;
+      }
+      body.appendChild(sheetRow(c.configured ? '更新密钥' : '设置密钥', '写入服务器的凭据文件，立即生效', function () {
+        close();
+        secretPrompt(c.label || c.ref, c.ref, function (v) {
+          rpc('credentials/set', { ref: c.ref, value: v }).then(function () {
+            toast('已保存，重启相关请求后生效');
+            settingsReload();
+          }).catch(function (e) { toast('保存失败：' + e.message); });
+        });
+      }));
+      if (c.configured) {
+        body.appendChild(sheetRow('清除密钥', '从凭据文件移除这一项', function () {
+          close();
+          rpc('credentials/unset', { ref: c.ref }).then(function () {
+            toast('已清除');
+            settingsReload();
+          }).catch(function (e) { toast('清除失败：' + e.message); });
+        }));
+      }
+    });
+  }
+
+  function nsDetail(name) {
+    var st = S.settings;
+    var n = st && st.doc && st.doc.namespaces.filter(function (x) { return x.ns === name; })[0];
+    if (!n) { toast('配置已变化，请刷新'); return; }
+    var leaves = settingsLeaves(n.value).slice(0, 60);
+    sheet(name, function (body, close) {
+      body.appendChild(el('div', 'sheet-note', 'rev ' + n.revision + ' · ' + n.applies + ' 生效'
+        + (n.user && Object.keys(n.user).length ? ' · 已有 ' + Object.keys(n.user).length + ' 项用户覆盖' : '')));
+      if ((n.secrets || []).length) {
+        body.appendChild(el('div', 'sheet-sep', '秘密槽（状态只读）'));
+        n.secrets.forEach(function (s) {
+          body.appendChild(sheetRow(s.path.join('.'), s.set ? '已设置' : '未设置', function () {}));
+        });
+      }
+      body.appendChild(el('div', 'sheet-sep', '可编辑字段（' + leaves.length + '）'));
+      if (!leaves.length) body.appendChild(el('div', 'hint', '这个配置项没有可以直接编辑的标量字段'));
+      leaves.forEach(function (leaf) {
+        var label = leaf.path.join('.');
+        var v = leaf.value;
+        var isBool = typeof v === 'boolean';
+        var shown = typeof v === 'string' ? truncate(v, 40) : String(v);
+        var row = sheetRow(label, shown + (n.user && leaf.path.length === 1 && Object.prototype.hasOwnProperty.call(n.user, leaf.path[0]) ? ' · 已覆盖' : ''), function () {
+          if (isBool) {
+            close();
+            toggleSetting(name, n.revision, leaf.path, !v, label);
+          } else {
+            var isNum = typeof v === 'number';
+            var input = prompt(label + '（' + (isNum ? '数字' : '文本') + '）', String(v));
+            if (input === null) return;
+            var out = isNum ? Number(input) : input;
+            if (isNum && !isFinite(out)) { toast('要填数字'); return; }
+            close();
+            mutateSetting(name, n.revision, leaf.path, out);
+          }
+        });
+        body.appendChild(row);
+      });
+    });
+  }
+
+  function mutateSetting(ns, rev, path, value) {
+    rpc('settings/mutate', { ns: ns, ops: [{ op: 'set', path: path, value: value }], expectedRevision: rev }).then(function () {
+      toast('已保存');
+      settingsReload();
+    }).catch(function (e) {
+      var msg = /conflict|stale/.test(String(e.code || '') + e.message) ? '配置已被改动，已刷新，请重试' : '保存失败：' + e.message;
+      toast(msg);
+      settingsReload();
+    });
+  }
+
+  function toggleSetting(ns, rev, path, next, label) {
+    sheet('确认修改', function (body, close) {
+      body.appendChild(el('div', 'sheet-note', label + ' → ' + (next ? '开' : '关')));
+      body.appendChild(sheetRow('确认写入', '立即生效（applies: live）', function () {
+        close();
+        mutateSetting(ns, rev, path, next);
+      }));
+      body.appendChild(sheetRow('取消', '', close));
+    });
+  }
+
+  function pluginSheet(p) {
+    var title = (p.meta && p.meta.title) || p.entryId || p.moduleName || '插件';
+    sheet(title, function (body, close) {
+      body.appendChild(el('div', 'sheet-note', [p.entryId, p.moduleName].filter(Boolean).join('  ·  ')));
+      if (p.meta && p.meta.description) body.appendChild(el('div', 'sheet-note', p.meta.description));
+      if (p.readOnlyReason) {
+        body.appendChild(el('div', 'hint', '这一项不能在这里开关：' + p.readOnlyReason));
+        return;
+      }
+      var next = p.enabled === false;
+      body.appendChild(sheetRow(next ? '启用' : '禁用', '写回 profile 的 cordis.patch.yml，立即热生效', function () {
+        close();
+        rpc('pluginManager/setPluginEnabled', { id: p.entryId, enabled: next }).then(function (v) {
+          toast((next ? '已启用' : '已禁用') + ((v && v.warnings && v.warnings.length) ? '（有 ' + v.warnings.length + ' 条警告）' : ''));
+          settingsReload();
+        }).catch(function (e) { toast('操作失败：' + e.message); });
+      }));
+    });
+  }
+
+  // ---------- skills (技能)
+  function renderSkills() {
+    if (!needSession()) return;
+    var st = S.skills;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('技能', [
+      { icon: 'refresh', label: '刷新', on: function () { S.skills = null; renderSkills(); } }
+    ]));
+    var sc = el('div', 'scroll');
+    var box = el('div', 'pane');
+    sc.appendChild(box);
+    frag.appendChild(sc);
+    mount(frag);
+
+    if (!st) {
+      box.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 读取技能…'));
+      rpc('skills/list', { request: { sessionId: S.cur.id } }).then(function (v) {
+        S.skills = { items: (v && v.skills) || [] };
+        if (S.view === 'skills') renderSkills();
+      }).catch(function (e) {
+        S.skills = { items: [], error: '读取技能失败：' + e.message };
+        if (S.view === 'skills') renderSkills();
+      });
+      return;
+    }
+    box.innerHTML = '';
+    if (st.error) box.appendChild(el('div', 'hint', st.error));
+    if (!st.items.length) box.appendChild(el('div', 'empty', '这个会话没有可用的技能'));
+    st.items.forEach(function (sk) {
+      var row = el('div', 'row');
+      row.appendChild(el('div', 'dot idle'));
+      var g = el('div', 'grow');
+      g.appendChild(el('div', 't', '/' + sk.name));
+      var m = el('div', 'm');
+      m.appendChild(el('span', null, truncate(String(sk.description || '').replace(/\s+/g, ' '), 90)));
+      g.appendChild(m);
+      row.appendChild(g);
+      row.addEventListener('click', function () {
+        sheet('/' + sk.name, function (body, close) {
+          if (sk.description) body.appendChild(el('div', 'sheet-note', sk.description));
+          if (sk.whenToUse) body.appendChild(el('div', 'sheet-note', '何时用：' + sk.whenToUse));
+          if (sk.path) body.appendChild(sheetRow('SKILL.md 路径', sk.path, function () { close(); copy(sk.path); }));
+          body.appendChild(sheetRow('复制技能名', '/' + sk.name + '（在对话里让模型用它）', function () { close(); copy(sk.name); }));
+        });
+      });
+      box.appendChild(row);
     });
   }
 
@@ -2904,7 +3216,7 @@
     if (S.term) { closeTermPage(); return 'nav'; }
     if (S.view === 'chat') { leaveChat(); return 'nav'; }
     if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more' || S.view === 'trajectory' || S.view === 'info') { closePanel(); return 'nav'; }
-    if (S.view === 'sched' || S.view === 'workspace') { closePanel(); return 'nav'; }
+    if (S.view === 'sched' || S.view === 'workspace' || S.view === 'skills') { closePanel(); return 'nav'; }
     if (S.view === 'settings') { S.view = S.server ? 'sessions' : 'setup'; render(); return 'nav'; }
     if (S.view === 'login') { S.view = 'sessions'; render(); return 'nav'; }
     return 'exit';
@@ -2958,6 +3270,11 @@
     termState: function () { return S.term; },
     termWrite: termWrite,
     wsState: function () { return S.ws; },
+    settingsState: function () { return S.settings; },
+    skillsState: function () { return S.skills; },
+    mutateSetting: mutateSetting,
+    pluginSheet: pluginSheet,
+    nsDetail: nsDetail,
     schedState: function () { return S.sched; },
     sessionActions: sessionActions,
     archiveBox: archiveBox,

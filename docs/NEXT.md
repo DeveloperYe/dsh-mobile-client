@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.8.0 | **设置可写**：凭据（9 个 API Key，改/清）、20 个配置项的标量字段编辑（带 revision CAS，过期即拒）、203 个插件清单 + 启停；**技能面板**（`skills/list`，9 个技能，可复制名称/SKILL.md 路径） |
 | 1.7.0 | **定时任务面板**（本会话 / 全部会话两种范围、规则与下次触发、详情、删除）+ **工作区管理**（`workspace/follow` 订阅、置顶、归档箱恢复、改名、登记/删除、按工区看会话、会话长按菜单、主列表隐藏已归档） |
 | 1.6.0 | **终端**：xterm 6.0.0（与宿主同版本，从 GUI 包里抽出内置）+ `terminal/*` 全套；多 shell、键栏、自适应尺寸、重开复用同一进程、明暗跟随 |
 
@@ -20,8 +21,9 @@
 1. ~~终端面板~~ ✅ 1.6.0
 2. ~~定时任务面板~~ ✅ 1.7.0（只能查看/删除；任务由模型用 `schedule_create` 建，RPC 层没有 create）
 3. ~~工作区管理~~ ✅ 1.7.0（置顶/归档/改名/登记/删除/排序接口已确认，排序 UI 未做）
-4. **设置写操作**（改凭据 `credentials/set`、`settings/mutate`、插件开关；目前只读）
-5. UI 细活：面板转场动效、归档箱分页（27 条一次全画）
+4. ~~设置写操作~~ ✅ 1.8.0（凭据 / 配置项 / 插件开关都通了）
+5. UI 细活：面板转场动效、归档箱分页（27 条一次全画）、设置面板按分组折叠（现在是一条长列表）
+6. 技能只能看不能装（`add_skill` 是模型侧工具，没有对应 RPC）
 
 ## 已核实的协议事实（避免重复踩坑）
 
@@ -127,6 +129,35 @@ directoryPicker/list({path?})                       -> DirectoryListing
   `weekly`(time,timeZone,weekdays) / `cron`(expression,timeZone)，都带 `title`、`prompt`、`scheduledAt`。
   `schedule/catalog()` 的条目额外带 `sessionId`、`status`、`lastDelivery?`。
 
+### `settings/*`、`credentials/*`、`pluginManager/*`、`skills/*`（2026-11-07 实测）
+
+```
+settings/describe()                                  -> {writable, hasDocument, namespaces:[{ns,schema,value,base?,user?,
+                                                        applies:'live', secrets:[{path,set}], revision}]}
+settings/mutate(ns, ops, expectedRevision?)          -> SettingsNamespaceView
+     ops = [{op:'set', path:[...], value}] | [{op:'unset', path:[...]}]
+settings/update(ns, patch, expectedRevision?)        -> 浅合并
+settings/replace(ns, section, expectedRevision?)     -> 整段替换
+credentials/describe(refs: string[])                 -> {ref:{configured, source, writable}}
+credentials/set(ref, value) | credentials/unset(ref)
+pluginManager/listPlugins()                          -> 203 条 {entryId, moduleName, enabled, fiberPhase,
+                                                        readOnlyReason?, meta?{title,description}, patchId?}
+pluginManager/listBundles()                          -> 20 个 bundle {name, version, description, meta?}
+pluginManager/setPluginEnabled(id, enabled)          -> {stage, target, enabled, changed, application, warnings}
+pluginInventory/list()                               -> {entries, agentPresets, managementAvailable}（旧入口，字段名不同）
+skills/list({sessionId})                             -> {skills:[{name, description, whenToUse?, path?, modelInvocable?}]}
+```
+
+- **凭据 ref 不是猜的**：ref 就是各命名空间值里声明的 `apiKeyEnv` 字符串（如 `SENSENOVA_API_KEY`），
+  扫一遍 `settings/describe()` 的 `value` 树就能拿到全部 ref；`credentials/describe(该数组)` 一次查齐是否已设置。
+- **`expectedRevision` 可以省略**（省略即无条件写），带上则是 CAS：过期会被拒、**不会落盘**（实测 rev 不变、user 层不变）。
+  编辑 UI 一定要带，否则并发改配置会静默覆盖。
+- 秘密字段永远不上线：`value` 里被 redact，状态只从 `secrets[{path,set}]` 读；写密钥走 `credentials/set`。
+- 布尔/字符串/数字可以直接 `settings/mutate` 到 path；**数组和嵌套 >2 层的对象没做编辑**（列表类字段目前只能看）。
+- `pluginManager/setPluginEnabled` 会**重写 profile 的 `cordis.patch.yml`**（即使值没变也报 `changed:true`），
+  `readOnlyReason`（`unaddressable` / `management-required`）的条目不能开关。命令行验证配置是否仍然合法：
+  `dsh --profile web --dump-config`（退出码 0）。
+
 ### 踩过的坑（都值得保留）
 
 1. **明文 HTTP 下没有 `crypto.randomUUID`**（secure context 限制），需自备 polyfill；`crypto.getRandomValues` 可用。
@@ -153,6 +184,8 @@ test/harness-term.mjs 终端面板：连接/输入/键盘/尺寸/重开复用/�
 test/probe-sched-ws.mjs    定时任务/工作区协议探针（含 request 包装验证）
 test/harness-sched-ws.mjs  定时任务 + 工作区：15 项断言（--skip-agent 跳过让模型建任务的慢路径）
 test/cleanup-harness-sessions.mjs 归档测试里新建的临时会话
+test/probe-settings.mjs / probe-settings-write.mjs / probe-settings-shape.mjs  设置读写语义探针
+test/harness-settings.mjs  设置可写 + 插件 + 技能：12 项断言（含真实写入与精确还原）
 test/measure.mjs      冷/热启动首帧耗时
 ```
 
