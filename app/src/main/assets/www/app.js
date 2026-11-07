@@ -636,6 +636,7 @@
     if (S.view === 'jobs') return renderJobs();
     if (S.view === 'goal') return renderGoal();
     if (S.view === 'trajectory') return renderTrajectory();
+    if (S.view === 'info') return renderInfo();
     if (S.view === 'chat' && S.cur) return renderChatView();
     return renderSessions();
   }
@@ -797,6 +798,7 @@
     items.push(['文件', function () { openPanel('files'); }]);
     items.push(['后台任务', function () { openPanel('jobs'); }]);
     items.push(['长期目标', function () { openPanel('goal'); }]);
+    items.push(['会话信息（计划/待办/交付物）', function () { openPanel('info'); }]);
     items.push(['轨迹', function () { openPanel('trajectory'); }]);
     items.push(['命令面板', commandPalette]);
     items.push(['选择模型', pickModel]);
@@ -1371,11 +1373,16 @@
     var u = p.tokenUsage || {};
     var s = p.sessionStats || {};
     var bits = [];
+    var tok = function (n) {
+      if (!n) return '0';
+      if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M';
+      if (n >= 1e3) return Math.round(n / 1e3) + 'k';
+      return String(n);
+    };
     if (u.cacheReadTokens || u.uncachedInputTokens) {
-      var inTok = (u.uncachedInputTokens || 0) + (u.cacheReadTokens || 0);
-      bits.push((inTok >= 1000 ? Math.round(inTok / 1000) + 'k' : inTok) + ' in');
+      bits.push(tok((u.uncachedInputTokens || 0) + (u.cacheReadTokens || 0)) + ' in');
     }
-    if (u.outputTokens) bits.push((u.outputTokens >= 1000 ? (u.outputTokens / 1000).toFixed(1) + 'k' : u.outputTokens) + ' out');
+    if (u.outputTokens) bits.push(tok(u.outputTokens) + ' out');
     if (s.steps) bits.push(s.steps + ' 步');
     if (s.llmMs) bits.push('LLM ' + Math.round(s.llmMs / 1000) + 's');
     var cp = p.contextPressure || {};
@@ -1523,6 +1530,89 @@
       }
       (best || nodes[0] || log).scrollIntoView({ block: 'center', behavior: 'smooth' });
     }, 150);
+  }
+
+  // ---------- session info: plan / todos / deliverables / subagents
+  // Everything here is derived from state the client already holds (projections
+  // and the durable record stream), so it adds no protocol surface.
+  function renderInfo() {
+    if (!needSession()) return;
+    var cur = S.cur;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('会话信息'));
+    var sc = el('div', 'scroll');
+    var box = el('div', 'pane');
+    sc.appendChild(box);
+    frag.appendChild(sc);
+    mount(frag);
+
+    var p = cur.projections || {};
+    var html = '';
+
+    var plan = p.plan || {};
+    if (plan && (plan.active || plan.pending)) {
+      html += '<h2>计划模式</h2><div class="hint">' + (plan.active ? '正在执行计划' : (plan.pending ? '待确认计划' : '')) + '</div>';
+    }
+
+    var todos = p.todos || [];
+    if (todos.length) {
+      var done = todos.filter(function (x) { return x.status === 'completed'; }).length;
+      html += '<h2>待办 ' + done + '/' + todos.length + '</h2><ul>';
+      todos.forEach(function (x) {
+        var mark = x.status === 'completed' ? '✔' : x.status === 'in_progress' ? '▶' : '○';
+        html += '<li>' + esc(mark + ' ' + x.content) + '</li>';
+      });
+      html += '</ul>';
+    }
+
+    var files = [];
+    (cur.records || []).forEach(function (r) {
+      var e = r.event || {};
+      if (e.type !== 'tool/call') return;
+      if (e.data && e.data.name === 'present') {
+        var a = safeJson(e.data.arguments);
+        if (a && Array.isArray(a.files)) {
+          a.files.forEach(function (f) {
+            if (f && f.path && !files.some(function (x) { return x.path === f.path; })) files.push(f);
+          });
+        }
+      }
+    });
+    html += '<h2>交付物 ' + (files.length || '') + '</h2>';
+    if (!files.length) html += '<div class="hint">这个会话还没有 present 交付物</div>';
+    files.forEach(function (f) {
+      html += '<div class="row" data-path="' + esc(f.path) + '"><div class="grow">'
+        + '<div class="t">' + esc(baseName(f.path)) + '</div>'
+        + '<div class="m"><span class="path">' + esc(f.path) + '</span></div></div></div>';
+    });
+
+    var subs = p.subagentCatalog || p.subagent || null;
+    var kids = [];
+    (cur.records || []).forEach(function (r) {
+      var e = r.event || {};
+      if (e.type === 'subagent/catalog' && e.data && e.data.childId) kids.push(e.data);
+    });
+    if (kids.length) {
+      html += '<h2>子代理 ' + kids.length + '</h2>';
+      kids.forEach(function (k) {
+        html += '<div class="row" data-open="' + esc(k.childId) + '"><div class="grow">'
+          + '<div class="t">' + esc(k.label || k.childId) + '</div>'
+          + '<div class="m"><span>' + esc(k.mode || '') + '</span></div></div></div>';
+      });
+    }
+
+    var stats = statsText(cur);
+    html += '<h2>用量</h2><div class="hint">' + esc(stats || '暂无') + '</div>';
+
+    box.innerHTML = html;
+    Array.prototype.forEach.call(box.querySelectorAll('[data-open]'), function (row) {
+      row.addEventListener('click', function () { openSession(row.dataset.open, '子代理'); });
+    });
+    Array.prototype.forEach.call(box.querySelectorAll('[data-path]'), function (row) {
+      row.addEventListener('click', function () {
+        try { navigator.clipboard.writeText(row.dataset.path); toast('路径已复制'); } catch (e) { toast(row.dataset.path); }
+      });
+    });
   }
 
   // ─────────────────────────── panels: files / jobs / goal / more settings
@@ -1940,7 +2030,7 @@
   /** Android back button: chat → list → settings → exit. */
   function goBack() {
     if (S.view === 'chat') { leaveChat(); return 'nav'; }
-    if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more' || S.view === 'trajectory') { closePanel(); return 'nav'; }
+    if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more' || S.view === 'trajectory' || S.view === 'info') { closePanel(); return 'nav'; }
     if (S.view === 'settings') { S.view = S.server ? 'sessions' : 'setup'; render(); return 'nav'; }
     if (S.view === 'login') { S.view = 'sessions'; render(); return 'nav'; }
     return 'exit';
