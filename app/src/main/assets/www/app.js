@@ -193,6 +193,10 @@
     searchOpen: false,
     query: '',
     searchHits: [],
+    prevView: null,
+    files: null,
+    jobs: null,
+    goal: null,
   };
 
   function saveCache() {
@@ -627,6 +631,10 @@
     if (S.view === 'login') return renderLogin();
     if (S.view === 'setup') return renderSetup(false);
     if (S.view === 'settings') return renderSettings();
+    if (S.view === 'more') return renderMore();
+    if (S.view === 'files') return renderFiles();
+    if (S.view === 'jobs') return renderJobs();
+    if (S.view === 'goal') return renderGoal();
     if (S.view === 'chat' && S.cur) return renderChatView();
     return renderSessions();
   }
@@ -785,6 +793,9 @@
   function chatMenu() {
     var cur = S.cur;
     var items = [];
+    items.push(['文件', function () { openPanel('files'); }]);
+    items.push(['后台任务', function () { openPanel('jobs'); }]);
+    items.push(['长期目标', function () { openPanel('goal'); }]);
     items.push(['命令面板', commandPalette]);
     items.push(['选择模型', pickModel]);
     items.push(['重命名会话', renameCur]);
@@ -1452,6 +1463,268 @@
     node.addEventListener('contextmenu', function (ev) { ev.preventDefault(); fn(); });
   }
 
+  // ─────────────────────────── panels: files / jobs / goal / more settings
+  //
+  // Panel shapes verified against the host type declarations:
+  //   workspaceFiles/list(workspaceFileScopeId, path) -> {path, entries:[{name,type,size?}]}
+  //   workspaceFiles/read(workspaceFileScopeId, path, {offset,limit}) -> {text, lines, eof}
+  //   job/list  (stream) -> {type:'rows', jobs:[...]};  job/kill({sessionId, jobId})
+  //   goals/get(agentId) -> GoalView | undefined
+  function openPanel(kind) {
+    S.prevView = S.view;
+    S.view = kind;
+    if (kind === 'files' && !S.files) S.files = { path: '', entries: null, inflight: false, error: '' };
+    if (kind === 'jobs') S.jobs = null;
+    if (kind === 'goal') S.goal = null;
+    render();
+  }
+
+  function closePanel() {
+    S.view = S.prevView || (S.cur ? 'chat' : 'sessions');
+    render();
+  }
+
+  function panelHeader(title, extra) {
+    var acts = [{ icon: 'back', label: '返回', on: closePanel }];
+    (extra || []).forEach(function (a) { acts.push(a); });
+    return header(title, '', acts);
+  }
+
+  function needSession() {
+    if (S.cur) return true;
+    toast('先打开一个会话');
+    closePanel();
+    return false;
+  }
+
+  // ---------- files
+  /** Host paths: '.' means the workspace root, children are absolute. */
+  function absOf(rel) {
+    var root = ((S.cur && S.cur.header && S.cur.header.cwd) || (S.cur && S.cur.cwd) || '').replace(/[\\/]+$/, '');
+    if (!rel) return '.';
+    return root + '\\' + rel.split('/').join('\\');
+  }
+
+  function renderFiles() {
+    if (!needSession()) return;
+    var st = S.files;
+    if (st.entries === null && !st.inflight) { loadDir(st.path); return; }
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('文件', [
+      { icon: 'search', label: '刷新', on: function () { loadDir(st.path); } }
+    ]));
+    frag.appendChild(el('div', 'statline', st.path ? '/' + st.path : '（工作区根目录）'));
+    var sc = el('div', 'scroll');
+    if (st.error) sc.appendChild(el('div', 'empty', st.error));
+    else if (st.entries === null) sc.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 载入中…'));
+    else {
+      if (st.path) {
+        var up = el('div', 'row');
+        up.appendChild(el('div', 'dot idle'));
+        var g0 = el('div', 'grow');
+        g0.appendChild(el('div', 't', '..'));
+        up.appendChild(g0);
+        up.addEventListener('click', function () {
+          var parts = st.path.split('/').filter(Boolean);
+          parts.pop();
+          loadDir(parts.join('/'));
+        });
+        sc.appendChild(up);
+      }
+      var list = st.entries || [];
+      if (!list.length && !st.path) sc.appendChild(el('div', 'empty', '目录为空'));
+      list.forEach(function (e) {
+        var row = el('div', 'row');
+        var g = el('div', 'grow');
+        g.appendChild(el('div', 't', (e.type === 'directory' ? '📁 ' : '📄 ') + e.name));
+        if (e.type === 'file' && e.size != null) {
+          var m = el('div', 'm');
+          m.appendChild(el('span', null, fmtBytes(e.size)));
+          g.appendChild(m);
+        }
+        row.appendChild(g);
+        row.addEventListener('click', function () {
+          var child = st.path ? st.path + '/' + e.name : e.name;
+          if (e.type === 'directory') loadDir(child);
+          else previewFile(child, e.name);
+        });
+        sc.appendChild(row);
+      });
+    }
+    frag.appendChild(sc);
+    mount(frag);
+  }
+
+  function loadDir(path) {
+    var st = S.files;
+    st.path = path || '';
+    st.inflight = true;
+    st.entries = null;
+    st.error = '';
+    if (S.view === 'files') renderFiles();
+    rpc('workspaceFiles/list', { workspaceFileScopeId: S.cur.id, path: st.path ? absOf(st.path) : '.' }).then(function (v) {
+      st.entries = (v && v.entries) || [];
+      if (v && typeof v.path === 'string') st.path = v.path;
+      st.inflight = false;
+      if (S.view === 'files') renderFiles();
+    }).catch(function (e) {
+      st.entries = [];
+      st.inflight = false;
+      st.error = '读取目录失败：' + e.message;
+      if (S.view === 'files') renderFiles();
+    });
+  }
+
+  function previewFile(path, name) {
+    sheet(name, function (body) {
+      body.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 读取中…'));
+      rpc('workspaceFiles/read', { workspaceFileScopeId: S.cur.id, path: absOf(path), range: { offset: 1, limit: 400 } })
+        .then(function (v) {
+          body.innerHTML = '';
+          body.appendChild(el('div', 'sheet-note', '第 ' + ((v && v.offset) || 1) + ' 行起 · ' + ((v && v.lines) || 0) + ' 行' + (v && v.eof ? ' · 到文件末尾' : '')));
+          var pre = el('pre');
+          pre.textContent = (v && v.text) || '(空文件)';
+          pre.style.maxHeight = '52vh';
+          pre.style.overflow = 'auto';
+          body.appendChild(pre);
+        })
+        .catch(function (e) {
+          body.innerHTML = '';
+          body.appendChild(el('div', 'empty', '这个文件不能当文本预览（' + e.message + '）'));
+        });
+    });
+  }
+
+  // ---------- jobs
+  function renderJobs() {
+    if (!needSession()) return;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('后台任务', [
+      { icon: 'search', label: '刷新', on: function () { S.jobs = null; renderJobs(); } }
+    ]));
+    var sc = el('div', 'scroll');
+    if (!S.jobs) sc.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 载入中…'));
+    else if (S.jobs.error) sc.appendChild(el('div', 'empty', S.jobs.error));
+    else if (!S.jobs.rows.length) sc.appendChild(el('div', 'empty', '没有后台任务'));
+    else {
+      S.jobs.rows.forEach(function (j) {
+        var row = el('div', 'row');
+        var g = el('div', 'grow');
+        g.appendChild(el('div', 't', j.title || j.command || j.jobId || '任务'));
+        var m = el('div', 'm');
+        m.appendChild(el('span', null, [j.status, j.kind, j.startedAt ? fmtTime(j.startedAt) : ''].filter(Boolean).join(' · ')));
+        g.appendChild(m);
+        row.appendChild(g);
+        var kill = el('button', 'btn ghost');
+        kill.textContent = '结束';
+        kill.style.padding = '6px 12px';
+        kill.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          rpc('job/kill', { request: { sessionId: S.cur.id, jobId: j.jobId } })
+            .then(function () { toast('已请求结束'); S.jobs = null; renderJobs(); })
+            .catch(function (e2) { toast('失败：' + e2.message); });
+        });
+        row.appendChild(kill);
+        sc.appendChild(row);
+      });
+    }
+    frag.appendChild(sc);
+    mount(frag);
+    if (!S.jobs) loadJobs();
+  }
+
+  function loadJobs() {
+    var rows = [];
+    var id = mux().open('job/list', { request: { sessionId: S.cur.id } }, {
+      onFrame: function (f) {
+        if (f && f.type === 'rows' && Array.isArray(f.jobs)) rows = f.jobs;
+        S.jobs = { rows: rows.slice() };
+        if (S.view === 'jobs') renderJobs();
+      },
+      onEnd: function () {
+        S.jobs = S.jobs || { rows: [] };
+        if (S.view === 'jobs') renderJobs();
+      },
+      onError: function (e) {
+        S.jobs = { rows: [], error: '读取任务失败：' + ((e && e.message) || '') };
+        if (S.view === 'jobs') renderJobs();
+      }
+    });
+    setTimeout(function () {
+      if (S.view !== 'jobs' && S.mux) S.mux.closeStream(id);
+    }, 20000);
+  }
+
+  // ---------- goal
+  function renderGoal() {
+    if (!needSession()) return;
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('长期目标'));
+    var sc = el('div', 'scroll');
+    var g = S.goal;
+    if (g === null) sc.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 载入中…'));
+    else if (g === undefined) sc.appendChild(el('div', 'empty', '这个会话没有设定目标'));
+    else if (g.error) sc.appendChild(el('div', 'empty', g.error));
+    else {
+      var box = el('div', 'pane');
+      box.innerHTML = '<h2>' + esc(g.objective || g.title || '（无标题）') + '</h2>'
+        + '<div class="hint">状态：' + esc(g.status || g.phase || '未知')
+        + (g.roundsStarted != null ? ' · 已进行 ' + g.roundsStarted + ' 轮' : '') + '</div>';
+      sc.appendChild(box);
+      var dump = el('pre');
+      dump.textContent = JSON.stringify(g, null, 1).slice(0, 4000);
+      dump.style.margin = '0 14px';
+      sc.appendChild(dump);
+    }
+    frag.appendChild(sc);
+    mount(frag);
+    if (S.goal === null) {
+      rpc('goals/get', { agentId: S.cur.id }).then(function (v) {
+        S.goal = v || undefined;
+        if (S.view === 'goal') renderGoal();
+      }).catch(function (e) {
+        S.goal = { error: '读取目标失败：' + e.message };
+        if (S.view === 'goal') renderGoal();
+      });
+    }
+  }
+
+  // ---------- settings (extra: providers / plugins, read-only)
+  function renderMore() {
+    var frag = document.createDocumentFragment();
+    frag.appendChild(panelHeader('更多设置'));
+    var sc = el('div', 'scroll');
+    var box = el('div', 'pane');
+    sc.appendChild(box);
+    frag.appendChild(sc);
+    mount(frag);
+    box.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 读取中…'));
+    Promise.all([
+      rpc('llm/listProviders', {}).catch(function (e) { return { error: e.message }; }),
+      rpc('pluginInventory/list', {}).catch(function (e) { return { error: e.message }; })
+    ]).then(function (res) {
+      box.innerHTML = '';
+      var prov = res[0], plug = res[1];
+      var h = '<h2>模型供应商</h2>';
+      var list = (prov && (prov.providers || prov.items)) || [];
+      if (prov && prov.error) h += '<div class="hint">读取失败：' + esc(prov.error) + '</div>';
+      else if (!list.length) h += '<div class="hint">' + esc(JSON.stringify(prov).slice(0, 400)) + '</div>';
+      else h += list.map(function (p) {
+        return '<div class="row"><div class="grow"><div class="t">' + esc(p.name || p.id) + '</div>'
+          + '<div class="m"><span>' + esc(p.id || '') + '</span></div></div></div>';
+      }).join('');
+      h += '<h2>已装插件</h2>';
+      var plugins = (plug && (plug.plugins || plug.items)) || [];
+      if (plug && plug.error) h += '<div class="hint">读取失败：' + esc(plug.error) + '</div>';
+      else if (!plugins.length) h += '<div class="hint">' + esc(JSON.stringify(plug).slice(0, 400)) + '</div>';
+      else h += plugins.slice(0, 40).map(function (p) {
+        return '<div class="row"><div class="grow"><div class="t">' + esc(p.name || p.id) + '</div>'
+          + '<div class="m"><span>' + esc([p.version, p.enabled === false ? '已禁用' : ''].filter(Boolean).join(' · ')) + '</span></div></div></div>';
+      }).join('');
+      box.innerHTML = h;
+    });
+  }
+
   function header(title, sub, actions) {
     var h = el('div', 'hdr');
     var t = el('h1');
@@ -1539,6 +1812,11 @@
     t.appendChild(injectBtn);
     inner.appendChild(t);
 
+    var more = el('button', 'btn ghost', '更多设置（模型供应商 / 插件）');
+    more.style.width = '100%'; more.style.marginTop = '10px';
+    more.addEventListener('click', function () { S.prevView = 'settings'; S.view = 'more'; render(); });
+    inner.appendChild(more);
+
     if (S.server) {
       var back = el('button', 'btn ghost', '返回会话列表');
       back.style.width = '100%'; back.style.marginTop = '10px';
@@ -1600,6 +1878,7 @@
   /** Android back button: chat → list → settings → exit. */
   function goBack() {
     if (S.view === 'chat') { leaveChat(); return 'nav'; }
+    if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more') { closePanel(); return 'nav'; }
     if (S.view === 'settings') { S.view = S.server ? 'sessions' : 'setup'; render(); return 'nav'; }
     if (S.view === 'login') { S.view = 'sessions'; render(); return 'nav'; }
     return 'exit';
@@ -1649,6 +1928,7 @@
     state: S, rpc: rpc, md: md, login: login, back: goBack,
     // test hooks (used by test/harness*.mjs)
     open: function (id, title) { openSession(id, title); },
+    panel: function (k) { openPanel(k); },
     send: function (text) { return sendPrompt(text, []); },
     list: function () { return loadSessions(); }
   };
