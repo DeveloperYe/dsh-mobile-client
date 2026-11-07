@@ -12,10 +12,11 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.6.0 | **终端**：xterm 6.0.0（与宿主同版本，从 GUI 包里抽出内置）+ `terminal/*` 全套；多 shell、键栏、自适应尺寸、重开复用同一进程、明暗跟随 |
 
 ## 剩余工作
 
-1. **终端面板**（未做，最难）
+1. ~~终端面板~~ ✅ 1.6.0 完成
 2. **定时任务**（`schedule/list` 的请求体形状未确认）
 3. **工作区管理**（改名/归档/置顶；`WorkspaceRenameRequest` 等字段未确认）
 4. **设置写操作**（改凭据 `credentials/set`、`settings/mutate`、插件开关）
@@ -46,7 +47,8 @@ goals/get(agentId)                goals/create|edit|pause|resume|complete|clear
 schedule/list(request)            schedule/catalog()      schedule/delete(request)  schedule/update(request)
 terminal/create(agentId, request) terminal/follow(agentId, id, attachmentId)*
 terminal/write(agentId, id, attachmentId, data)  terminal/resize(agentId, id, attachmentId, cols, rows)
-terminal/list(sessionId)          terminal/close(agentId, id)   terminal/shells(agentId)
+terminal/list(sessionId)          terminal/retain(sessionId, id)*  terminal/close(agentId, id)
+terminal/shells(agentId)          terminal/environment(agentId)  terminal/rename(agentId, id, title)
 llm/listProviders()               pluginInventory/list()
 workspace/create|rename|delete|follow*|pinSession|archiveSession|unarchiveSession|unpinSession
 ```
@@ -72,6 +74,28 @@ workspace/create|rename|delete|follow*|pinSession|archiveSession|unarchiveSessio
 - `user-questions/request` → `request: {questions:[{id, question, header?, detail?, options?:[{label,description?}], multiSelect?}]}`，
   `value` = `{answers:[{id, selected:[label...], custom?}]}`
 
+### 终端协议（2026-11-07 全链路实测）
+
+```
+environment(agentId) -> {cwd, maxInputBytes:65536, maxCols:500, maxRows:200, scrollback:1000}
+shells(agentId)      -> [{path,name,args}]  // bg1: cmd.exe, bash(-i), pwsh(-NoLogo), powershell(-NoLogo)
+list(sessionId)      -> WebTerminalInfo[]   // 注意是 sessionId，不是 agentId
+create(agentId,{id,shellPath?,cols,rows}) -> WebTerminalInfo     // id 由客户端自己 uuid，幂等
+retain(sessionId,id) 流 -> [{type:'retained'}]                    // 窗口持有，停止空闲回收调度
+follow(agentId,id,attachmentId) 流 -> snapshot / output / state
+close(agentId,id) | rename(agentId,id,title)
+```
+
+- **attach 即抢控制权**：`follow` 会把 `info.controllerId` 设成你的 attachmentId，旧的变只读；
+  `writable = info.state==='running' && info.controllerId===attachmentId`。
+- 帧：`{type:'snapshot',sequence,screen,info}` / `{type:'output',sequence,data}`（sequence 必须连续，
+  断号就重新 attach）/ `{type:'state',info}`。**snapshot 的 `screen` 是 `@xterm/addon-serialize` 的输出**，
+  所以前端必须跑**同版本 xterm（6.0.0）**才能正确重放；因此 `app/src/main/assets/www/vendor/xterm.js`
+  是用 `tools/extract-xterm.mjs` 从 GUI 的 `client.terminal.js` 里**原样抽出来的 UMD**（xterm 6.0.0 + addon-fit 0.11.0），
+  首次打开终端时才懒加载，不影响启动速度。
+- 不持有（`retain`）时，空闲 **2 小时**（`unattendedTimeoutMs`）会被回收；每会话最多 **8** 个终端。
+- 退出浮层**不结束进程**：重进会用 list 里同一个 id 重新 attach，snapshot 把历史屏幕补回来。
+
 ### 踩过的坑（都值得保留）
 
 1. **明文 HTTP 下没有 `crypto.randomUUID`**（secure context 限制），需自备 polyfill；`crypto.getRandomValues` 可用。
@@ -93,6 +117,8 @@ test/harness-b.mjs    搜索/选目录/命令面板/长按消息
 test/harness-c2.mjs   文件浏览与预览/任务/目标
 test/harness-traj.mjs 轨迹面板
 test/harness-info.mjs 会话信息面板
+test/probe-term.mjs   终端协议裸探针（一元 + 流，逐帧打印）
+test/harness-term.mjs 终端面板：连接/输入/键盘/尺寸/重开复用/主题，10 项断言
 test/measure.mjs      冷/热启动首帧耗时
 ```
 

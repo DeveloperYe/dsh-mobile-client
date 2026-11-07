@@ -795,6 +795,7 @@
   function chatMenu() {
     var cur = S.cur;
     var items = [];
+    items.push(['终端', openTerminal]);
     items.push(['文件', function () { openPanel('files'); }]);
     items.push(['后台任务', function () { openPanel('jobs'); }]);
     items.push(['长期目标', function () { openPanel('goal'); }]);
@@ -1841,6 +1842,447 @@
     }
   }
 
+  // ---------- terminal
+  //
+  // Protocol (verified live 2026-11-07 against dsh 0.2.0-rc.2, see docs/NEXT.md):
+  //   environment(agentId) -> {cwd,maxInputBytes,maxCols,maxRows,scrollback}
+  //   shells(agentId)      -> [{path,name,args}]
+  //   list(sessionId)      -> WebTerminalInfo[]          (note: sessionId, not agentId)
+  //   create(agentId,{id,shellPath?,cols,rows}) -> WebTerminalInfo   (id is client-minted, idempotent)
+  //   retain(sessionId,id) stream -> [{type:'retained'}]  (physical window hold; stops idle reaping)
+  //   follow(agentId,id,attachmentId) stream -> {type:'snapshot',sequence,screen,info}
+  //                                             {type:'output',sequence,data}
+  //                                             {type:'state',info}
+  //   write(agentId,id,attachmentId,data) | resize(agentId,id,attachmentId,cols,rows)
+  //   close(agentId,id) | rename(agentId,id,title)
+  // Attaching always hands input control to the newest attachment (info.controllerId).
+  // The screen snapshot is @xterm/addon-serialize output, so we must run the same
+  // xterm version the host uses (6.0.0) — loaded lazily from assets on first open.
+  var xtermLoad = null;
+
+  function loadXterm() {
+    if (window.Terminal && window.FitAddon) return Promise.resolve();
+    if (xtermLoad) return xtermLoad;
+    xtermLoad = new Promise(function (resolve, reject) {
+      var css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = './vendor/xterm.css';
+      document.head.appendChild(css);
+      var s = document.createElement('script');
+      s.src = './vendor/xterm.js';
+      s.onload = function () { if (window.Terminal) resolve(); else reject(new Error('终端组件未就绪')); };
+      s.onerror = function () { xtermLoad = null; reject(new Error('终端组件加载失败')); };
+      document.head.appendChild(s);
+    });
+    return xtermLoad;
+  }
+
+  function termKey(sid) { return 'dshm.term.' + sid; }
+
+  function termTheme() {
+    var cs = getComputedStyle(document.documentElement);
+    var v = function (n, d) { var x = (cs.getPropertyValue(n) || '').trim(); return x || d; };
+    var light = document.documentElement.dataset.theme === 'light';
+    return {
+      background: v('--bg-elev', '#171a21'),
+      foreground: v('--fg', '#e7e9ee'),
+      cursor: v('--accent', '#4f8cff'),
+      cursorAccent: v('--bg-elev', '#171a21'),
+      selectionBackground: light ? 'rgba(47,111,228,.22)' : 'rgba(79,140,255,.32)',
+      black: light ? '#40474f' : '#1b1f27', red: '#e5484d', green: light ? '#127a52' : '#3ddc97',
+      yellow: light ? '#8a6116' : '#e7c15a', blue: light ? '#2f6fe4' : '#4f8cff',
+      magenta: light ? '#8a3fa8' : '#c792ea', cyan: light ? '#0e7490' : '#56c8d8',
+      white: light ? '#5b6472' : '#d6dae2',
+      brightBlack: light ? '#78828f' : '#5a6373', brightRed: '#ff6b6b', brightGreen: '#63e8ad',
+      brightYellow: '#f0d07c', brightBlue: '#79a7ff', brightMagenta: '#d9a9f5',
+      brightCyan: '#7ad8e6', brightWhite: light ? '#131722' : '#ffffff'
+    };
+  }
+
+  function termFail(st, msg) {
+    if (!st || st.disposed) return;
+    st.error = msg || '未知错误';
+    st.status = 'error';
+    st.writable = false;
+    termStatus(st);
+  }
+
+  function termErrText(e) {
+    if (!e) return '未知错误';
+    if (e.code === 'terminal/limit-reached') return '终端数量已达上限（' + ((e.details && e.details.limit) || '?') + '），先关闭一个';
+    if (e.code === 'terminal/unavailable') return '终端已结束，请新建';
+    if (e.code === 'terminal/control-unavailable') return '没有输入控制权（另一个窗口正在操作）';
+    return e.message || String(e);
+  }
+
+  function termStatus(st) {
+    if (!st || st.disposed) return;
+    var info = st.info || {};
+    var label = st.error ? st.error
+      : st.status === 'connecting' ? '连接中…'
+        : st.status === 'ended' || st.status === 'closed' ? '已断开'
+          : st.status === 'exited' ? '进程已退出' + (info.exitCode != null ? '（' + info.exitCode + '）' : '')
+            : st.status === 'failed' ? '启动失败'
+              : st.writable ? '运行中' : '只读';
+    if (st.sub) {
+      var bits = [];
+      if (info.shell && info.shell.name) bits.push(info.shell.name);
+      bits.push(label);
+      if (info.cols) bits.push(info.cols + '×' + info.rows);
+      st.sub.textContent = ' ' + bits.join(' · ');
+    }
+    if (st.bar) {
+      st.bar.textContent = st.error ? st.error : (info.cwd || (st.env && st.env.cwd) || '正在读取工作目录…');
+      st.bar.classList.toggle('bad', !!st.error);
+    }
+    if (st.spin) st.spin.hidden = !!(st.status === 'connected' && st.info);
+    if (st.keys) st.keys.classList.toggle('off', !st.writable);
+  }
+
+  /** Build the overlay page once; render() never touches it. */
+  function termPage(st) {
+    var page = el('div', 'termpage');
+    var hdr = el('div', 'hdr');
+    var back = el('button', 'iconbtn');
+    back.setAttribute('aria-label', '返回');
+    back.appendChild(icon('back', 19));
+    back.addEventListener('click', closeTermPage);
+    var h1 = el('h1', null, '终端');
+    st.sub = el('span', 'sub', ' 连接中…');
+    h1.appendChild(st.sub);
+    var add = el('button', 'iconbtn');
+    add.setAttribute('aria-label', '新建终端');
+    add.appendChild(icon('plus', 19));
+    add.addEventListener('click', function () { termNew(st); });
+    var more = el('button', 'iconbtn');
+    more.setAttribute('aria-label', '终端菜单');
+    more.appendChild(icon('more', 19));
+    more.addEventListener('click', function () { termMenu(st); });
+    hdr.appendChild(back); hdr.appendChild(h1); hdr.appendChild(add); hdr.appendChild(more);
+
+    st.bar = el('div', 'termbar');
+    st.bar.addEventListener('click', function () { termCopy(st.bar.textContent); });
+
+    var wrap = el('div', 'termwrap');
+    st.host = el('div', 'termhost');
+    st.spin = el('div', 'termspin');
+    st.spin.innerHTML = '<span class="spin-sm"></span> 正在连接终端…';
+    wrap.appendChild(st.host);
+    wrap.appendChild(st.spin);
+
+    st.keys = el('div', 'termkeys');
+    [['Esc', '\u001b'], ['Tab', '\t'], ['^C', '\u0003'], ['^D', '\u0004'], ['↑', '\u001b[A'], ['↓', '\u001b[B'], ['⏎', '\r']].forEach(function (k) {
+      var b = el('button', 'kbtn', k[0]);
+      if (k[0] === '^C') b.classList.add('danger');
+      b.addEventListener('click', function () { termWrite(st, k[1]); });
+      st.keys.appendChild(b);
+    });
+    var inp = document.createElement('input');
+    inp.className = 'terminput';
+    inp.type = 'text';
+    inp.setAttribute('autocapitalize', 'off');
+    inp.setAttribute('autocomplete', 'off');
+    inp.setAttribute('autocorrect', 'off');
+    inp.spellcheck = false;
+    inp.placeholder = '输入命令后回车执行';
+    inp.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); termLine(st, inp.value); inp.value = ''; }
+    });
+    st.input = inp;
+    var send = el('button', 'kbtn primary', '发送');
+    send.addEventListener('click', function () { termLine(st, inp.value); inp.value = ''; });
+    st.keys.appendChild(inp);
+    st.keys.appendChild(send);
+
+    page.appendChild(hdr);
+    page.appendChild(st.bar);
+    page.appendChild(wrap);
+    page.appendChild(st.keys);
+    st.page = page;
+    st.wrap = wrap;
+    return page;
+  }
+
+  function openTerminal() {
+    if (!S.cur) { toast('先打开一个会话'); return; }
+    if (S.term && S.term.page && S.term.page.parentNode) return;
+    var st = S.term = {
+      sid: S.cur.id, id: null, info: null, env: null, shells: [], term: null, fit: null,
+      followId: null, retainId: null, attachmentId: null, lastSeq: null,
+      status: 'connecting', error: '', writable: false, disposed: false, q: Promise.resolve(),
+      sentCols: 0, sentRows: 0
+    };
+    document.body.appendChild(termPage(st));
+    termStatus(st);
+    loadXterm().then(function () {
+      if (st.disposed) return;
+      st.term = new window.Terminal({
+        cols: 80, rows: 24, fontSize: 12.5, lineHeight: 1.22,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Cascadia Mono", monospace',
+        cursorBlink: true, scrollback: 2000, convertEol: false,
+        allowProposedApi: true, theme: termTheme(), scrollOnUserInput: true
+      });
+      st.fit = new window.FitAddon.FitAddon();
+      st.term.loadAddon(st.fit);
+      st.term.open(st.host);
+      try { st.term.options.theme = termTheme(); } catch (e) {}
+      st.term.onData(function (d) { termWrite(st, d); });
+      termFit(st);
+      return termBoot(st);
+    }).catch(function (e) { termFail(st, e.message); });
+    window.addEventListener('resize', termRefit);
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', termRefit);
+    // follow theme switches from any code path, not just the settings toggle
+    if (!st.themeObs) {
+      st.themeObs = new MutationObserver(function () {
+        if (st.term && !st.disposed) { try { st.term.options.theme = termTheme(); } catch (e) {} }
+      });
+      st.themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    }
+  }
+
+  function termRefit() {
+    var st = S.term;
+    if (st && !st.disposed && st.term) termFit(st);
+  }
+
+  function termFit(st) {
+    if (!st || !st.fit || !st.term) return;
+    var d;
+    try { d = st.fit.proposeDimensions(); } catch (e) { return; }
+    if (!d || !isFinite(d.cols) || !isFinite(d.rows)) return;
+    var env = st.env || { maxCols: 500, maxRows: 200 };
+    var cols = Math.max(2, Math.min(d.cols, env.maxCols || 500));
+    var rows = Math.max(1, Math.min(d.rows, env.maxRows || 200));
+    if (st.term.cols !== cols || st.term.rows !== rows) {
+      try { st.term.resize(cols, rows); } catch (e) { return; }
+    }
+    if (cols === st.sentCols && rows === st.sentRows) return;
+    if (!st.writable) return;
+    st.sentCols = cols; st.sentRows = rows;
+    rpc('terminal/resize', { agentId: st.sid, id: st.id, attachmentId: st.attachmentId, cols: cols, rows: rows })
+      .catch(function () { st.sentCols = 0; st.sentRows = 0; });
+  }
+
+  function termBoot(st) {
+    var sid = st.sid;
+    return Promise.all([
+      rpc('terminal/environment', { agentId: sid }),
+      rpc('terminal/list', { sessionId: sid })
+    ]).then(function (res) {
+      st.env = res[0] || { cwd: '', maxCols: 500, maxRows: 200 };
+      st.env.cwd = (st.env.cwd || '').replace(/[\\/]+$/, '');
+      var list = res[1] || [];
+      var saved = lsGet(termKey(sid), '');
+      var pick = null;
+      for (var i = 0; i < list.length; i++) if (saved && list[i].id === saved) pick = list[i];
+      if (!pick && list.length) pick = list[0];
+      if (pick) { st.id = pick.id; return pick; }
+      return rpc('terminal/shells', { agentId: sid }).then(function (shells) {
+        st.shells = shells || [];
+        var prev = lsGet('dshm.term.shell', '');
+        var path = '';
+        for (var j = 0; j < st.shells.length; j++) if (st.shells[j].path === prev) path = prev;
+        if (!path && st.shells.length) path = st.shells[0].path;
+        st.id = uuid();
+        var req = { id: st.id, cols: Math.min(80, st.env.maxCols || 80), rows: Math.min(24, st.env.maxRows || 24) };
+        if (path) { req.shellPath = path; lsSet('dshm.term.shell', path); }
+        return rpc('terminal/create', { agentId: sid, request: req });
+      });
+    }).then(function (info) {
+      if (st.disposed || !info) return;
+      st.info = info;
+      lsSet(termKey(sid), st.id);
+      termStatus(st);
+      termConnect(st);
+    }).catch(function (e) { termFail(st, termErrText(e)); });
+  }
+
+  function termDetach(st) {
+    var m = S.mux;
+    if (st.followId && m) m.closeStream(st.followId);
+    if (st.retainId && m) m.closeStream(st.retainId);
+    st.followId = null; st.retainId = null; st.attachmentId = null; st.lastSeq = null;
+  }
+
+  /** (Re)attach: fresh snapshot + input control; the process itself is untouched. */
+  function termConnect(st, forceNew) {
+    if (!st || st.disposed || !st.id) return;
+    termDetach(st);
+    st.error = '';
+    st.status = 'connecting';
+    st.writable = false;
+    st.sentCols = 0; st.sentRows = 0;
+    termStatus(st);
+    var m = mux();
+    st.attachmentId = uuid();
+    st.retainId = m.open('terminal/retain', { sessionId: st.sid, id: st.id }, {
+      onFrame: function () {}, onEnd: function () {}, onError: function () {}
+    });
+    st.followId = m.open('terminal/follow', { agentId: st.sid, id: st.id, attachmentId: st.attachmentId }, {
+      onFrame: function (f) { termFrame(st, f); },
+      onEnd: function () {
+        if (st.disposed) return;
+        st.status = 'ended';
+        st.writable = false;
+        termStatus(st);
+      },
+      onError: function (e) {
+        if (st.disposed) return;
+        termFail(st, termErrText(e));
+      }
+    });
+    if (forceNew && st.term) { try { st.term.reset(); } catch (e) {} }
+  }
+
+  function termFrame(st, f) {
+    if (st.disposed || !st.term || !f) return;
+    if (f.type === 'snapshot') {
+      st.lastSeq = f.sequence;
+      st.info = f.info;
+      st.status = f.info.state === 'running' ? 'connected' : f.info.state;
+      st.writable = f.info.state === 'running' && f.info.controllerId === st.attachmentId;
+      st.error = '';
+      try { st.term.reset(); } catch (e) {}
+      if (f.screen) st.term.write(f.screen);
+      termStatus(st);
+      termFit(st);
+      return;
+    }
+    if (f.type === 'output') {
+      if (st.lastSeq != null && f.sequence !== st.lastSeq + 1) { termConnect(st); return; }
+      st.lastSeq = f.sequence;
+      st.term.write(f.data);
+      return;
+    }
+    if (f.type === 'state') {
+      st.info = f.info;
+      st.status = f.info.state === 'running' ? 'connected' : f.info.state;
+      st.writable = f.info.state === 'running' && f.info.controllerId === st.attachmentId;
+      termStatus(st);
+    }
+  }
+
+  function termWrite(st, data) {
+    if (!st || st.disposed || !st.id) return;
+    if (!st.writable) {
+      if (st.status === 'connecting') return;
+      toast('终端当前只读，菜单里“重新连接”可取回输入权');
+      return;
+    }
+    var args = { agentId: st.sid, id: st.id, attachmentId: st.attachmentId, data: data };
+    st.q = st.q.then(function () { return rpc('terminal/write', args); }).catch(function (e) {
+      termFail(st, termErrText(e));
+    });
+  }
+
+  function termLine(st, text) {
+    if (!text) { termWrite(st, '\r'); return; }
+    termWrite(st, text + '\r');
+  }
+
+  function termText(st) {
+    if (!st || !st.term) return '';
+    var buf = st.term.buffer.active, out = [];
+    for (var i = 0; i < buf.length; i++) {
+      var ln = buf.getLine(i);
+      out.push(ln ? ln.translateToString(true) : '');
+    }
+    while (out.length && !out[out.length - 1]) out.pop();
+    return out.join('\n');
+  }
+
+  function termCopy(t) {
+    try { navigator.clipboard.writeText(t); toast('已复制'); } catch (e) { toast('复制失败'); }
+  }
+
+  function closeTermPage() {
+    var st = S.term;
+    if (!st) return;
+    st.disposed = true;
+    if (st.themeObs) { try { st.themeObs.disconnect(); } catch (e) {} }
+    termDetach(st);
+    window.removeEventListener('resize', termRefit);
+    if (window.visualViewport) window.visualViewport.removeEventListener('resize', termRefit);
+    try { if (st.term) st.term.dispose(); } catch (e) {}
+    if (st.page) st.page.remove();
+    S.term = null;
+  }
+
+  function termNew(st) {
+    if (!st || !st.env) { toast('终端还没准备好'); return; }
+    rpc('terminal/shells', { agentId: st.sid }).then(function (shells) {
+      sheet('新建终端', function (body, close) {
+        (shells || []).forEach(function (sh) {
+          body.appendChild(sheetRow(sh.name, sh.path, function () { close(); termSpawn(st, sh.path); }));
+        });
+        if (!(shells || []).length) body.appendChild(el('div', 'empty', '没有可用的 shell'));
+      });
+    }).catch(function (e) { toast(termErrText(e)); });
+  }
+
+  function termSpawn(st, shellPath) {
+    var cols = Math.min(st.term ? st.term.cols : 80, (st.env && st.env.maxCols) || 500);
+    var rows = Math.min(st.term ? st.term.rows : 24, (st.env && st.env.maxRows) || 200);
+    var req = { id: uuid(), cols: Math.max(2, cols), rows: Math.max(1, rows) };
+    if (shellPath) req.shellPath = shellPath;
+    rpc('terminal/create', { agentId: st.sid, request: req }).then(function (info) {
+      lsSet(termKey(st.sid), info.id);
+      st.id = info.id;
+      st.info = info;
+      termConnect(st, true);
+    }).catch(function (e) { toast(termErrText(e)); });
+  }
+
+  function termMenu(st) {
+    if (!st) return;
+    rpc('terminal/list', { sessionId: st.sid }).catch(function () { return []; }).then(function (list) {
+      list = list || [];
+      sheet('终端', function (body, close) {
+        body.appendChild(sheetRow('复制全部输出', '当前屏幕与回滚缓冲区写入剪贴板', function () {
+          close();
+          termCopy(termText(st));
+        }));
+        body.appendChild(sheetRow('重新连接', '重新获取屏幕快照与输入控制权', function () {
+          close();
+          termConnect(st);
+        }));
+        body.appendChild(sheetRow('新建终端', '在会话工作目录里开一个新 shell', function () {
+          close();
+          termNew(st);
+        }));
+        body.appendChild(sheetRow('重命名', (st.info && st.info.title) || '当前终端', function () {
+          close();
+          var t = prompt('终端名称', (st.info && st.info.title) || '');
+          if (!t) return;
+          rpc('terminal/rename', { agentId: st.sid, id: st.id, title: t }).catch(function (e) { toast(termErrText(e)); });
+        }));
+        if (list.length > 1) {
+          body.appendChild(el('div', 'sheet-sep', '运行中的终端'));
+          list.forEach(function (it) {
+            body.appendChild(sheetRow(it.title + (it.id === st.id ? '（当前）' : ''), it.state + ' · ' + it.cols + '×' + it.rows, function () {
+              close();
+              if (it.id === st.id) return;
+              lsSet(termKey(st.sid), it.id);
+              st.id = it.id;
+              st.info = it;
+              termConnect(st, true);
+            }));
+          });
+        }
+        body.appendChild(el('div', 'sheet-sep', '危险操作'));
+        body.appendChild(sheetRow('关闭这个终端', '结束进程，正在运行的任务会被终止', function () {
+          close();
+          rpc('terminal/close', { agentId: st.sid, id: st.id }).then(function () {
+            lsSet(termKey(st.sid), '');
+            closeTermPage();
+            toast('终端已关闭');
+          }).catch(function (e) { toast(termErrText(e)); });
+        }));
+      });
+    });
+  }
+
   // ---------- settings (extra: providers / plugins, read-only)
   function renderMore() {
     var frag = document.createDocumentFragment();
@@ -1950,6 +2392,7 @@
       S.theme = S.theme === 'dark' ? 'light' : 'dark';
       lsSet(K.theme, S.theme);
       document.documentElement.dataset.theme = S.theme;
+      if (S.term && S.term.term) { try { S.term.term.options.theme = termTheme(); } catch (e) {} }
       render();
     });
     t.appendChild(themeBtn);
@@ -2029,6 +2472,7 @@
 
   /** Android back button: chat → list → settings → exit. */
   function goBack() {
+    if (S.term) { closeTermPage(); return 'nav'; }
     if (S.view === 'chat') { leaveChat(); return 'nav'; }
     if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more' || S.view === 'trajectory' || S.view === 'info') { closePanel(); return 'nav'; }
     if (S.view === 'settings') { S.view = S.server ? 'sessions' : 'setup'; render(); return 'nav'; }
@@ -2080,6 +2524,10 @@
     state: S, rpc: rpc, md: md, login: login, back: goBack,
     // test hooks (used by test/harness*.mjs)
     open: function (id, title) { openSession(id, title); },
+    openTerminal: openTerminal,
+    termState: function () { return S.term; },
+    termWrite: termWrite,
+    closeTermPage: closeTermPage,
     panel: function (k) { openPanel(k); },
     send: function (text) { return sendPrompt(text, []); },
     list: function () { return loadSessions(); }
