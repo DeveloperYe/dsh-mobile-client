@@ -190,6 +190,36 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 8. **明文 http 下 `navigator.clipboard` 根本不存在**（0.2.2 升级后才发现「复制」一直是坏的：点了只弹文本、没进剪贴板）。修法：优先走原生桥 `window.DSHMAndroid.copy()`（MainActivity 里用 ClipboardManager），再退 `navigator.clipboard`、再退 `document.execCommand('copy')`。
 9. 本机 `github.com:443` 不通，推送走 `.github`/`work` 里的 Git Data API 脚本；`dl.google.com`、Maven Central 可达（CI 在 ubuntu runner 上编译，本机不装 Android SDK）。
 
+## 离线出包（不依赖 GitHub Actions）
+
+```
+pwsh -File tools/build-local.ps1      # -> dist/dsh-mobile.apk
+```
+
+2026-11-10 GitHub Actions 整站故障（`Actions major_outage`，run 零 job 直接 failure）时打通的一条
+**无 SDK、无 Gradle、无 AGP** 的本地产线，只用已经在机器上的 build-tools + 一个 `android.jar`：
+
+- 需要的物料：`tools/buildtools/android-14/`（aapt2 / zipalign / apksigner，136.6 MB，本来就有）、
+  `tools/platform/android-34-ext12/android.jar`（25 MB，从 `platform-34-ext12_r01.zip` 里单抽）、
+  `tools/platform/android-16/lib/d8.jar`（build-tools 36.1 的 d8）、JDK（本机 25）、仓库里的 `keystore.jks`。
+  合计新增磁盘 **约 25 MB**（build-tools 36.1 只抽 d8.jar 约 17 MB）。
+- 流程：`aapt2 compile` → `aapt2 link -A assets --java gen` → `javac -source 17 -target 17 -classpath android.jar`
+  → `java -cp d8.jar com.android.tools.r8.D8` → 规范化 zip 条目名 → `jar uf` 塞 classes.dex →
+  `zipalign -f 4` → `apksigner sign`（同一 keystore，可与 CI 包互相覆盖安装）。
+
+**三个必踩的坑（都已写进脚本）**：
+
+1. **AGP 会注入 manifest 的 `package` 属性**，裸 aapt2 必须自己补，否则报 `<manifest> must have a 'package' attribute`；
+   脚本把带 package 的副本写到 `build/manual/AndroidManifest.xml`，不动源文件。
+2. **build-tools 34 的 d8（R8 8.2.2）读不了 JDK 25 javac 的产物**，任何内部类都会 NPE
+   （`Cannot invoke "String.length()" because "<parameter1>" is null`），降 `-source 8/11` 都无用；
+   换 build-tools **36.1** 的 d8.jar 立刻正常。用 1.8.1 的源码做过对照，确认与本项目代码无关。
+3. **aapt2 在 Windows 上把 `-A` 的资源条目名写成反斜杠**（`assets/www\app.js`），Android 的 AssetManager
+   用正斜杠找不到 → 装上白屏。`tools/fix-zip-names.ps1` 重写 zip 条目名，并保持
+   **`resources.arsc` 不压缩**（targetSdk ≥ 30 的硬要求，压缩了装不上）。
+
+产物自检：`verify-apk` 14 个条目齐全、v2+v3 签名、assets 与仓库源文件 **sha256 逐一相同**、dex magic `dex\n038`。
+
 ## 测试台
 
 ```

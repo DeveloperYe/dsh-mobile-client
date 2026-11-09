@@ -6,6 +6,9 @@ scratch/
 .gradle/
 build/
 local.properties
-tools/
+tools/*
+!tools/build-local.ps1
+!tools/fix-zip-names.ps1
+!tools/refresh-state.mjs
 
 dist/
