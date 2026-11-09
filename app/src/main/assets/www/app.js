@@ -108,7 +108,9 @@
           var body = parts[i], lang = '';
           var nl = body.indexOf('\n');
           if (nl >= 0) { lang = body.slice(0, nl).trim(); body = body.slice(nl + 1); }
-          out += '<pre><code>' + esc(body.replace(/\n$/, '')) + '</code></pre>';
+          var code = esc(body.replace(/\n$/, ''));
+          out += '<div class="codeblock"><div class="codebar"><span>' + esc(lang || 'code') + '</span>'
+            + '<button class="codecopy" type="button">复制</button></div><pre><code>' + code + '</code></pre></div>';
         } else {
           out += blocks(parts[i]);
         }
@@ -202,6 +204,8 @@
     ws: null,
     settings: null,
     skills: null,
+    drawer: null,
+    drawerQuery: '',
   };
 
   function saveCache() {
@@ -310,6 +314,11 @@
     this.streams.set(id, { id: id, endpoint: endpoint, args: args, onFrame: handlers.onFrame, onEnd: handlers.onEnd, onError: handlers.onError });
     if (this.ws && this.ws.readyState === 1) this.send({ type: 'open', streamId: id, endpoint: endpoint, payload: { args: args } });
     return id;
+  };
+  /** Push one uplink item on a bidirectional stream (terminal input/ack protocol). */
+  Mux.prototype.push = function (id, value) {
+    if (!this.streams.has(id)) return false;
+    return this.send({ type: 'item', streamId: id, value: value });
   };
   Mux.prototype.closeStream = function (id) {
     if (this.streams.has(id)) { this.send({ type: 'end', streamId: id }); this.streams.delete(id); }
@@ -795,21 +804,141 @@
     var frag = document.createDocumentFragment();
     var title = cur.projections.title || cur.title || '会话';
     frag.appendChild(header(title, '', [
-      { icon: 'back', label: '返回', on: function () { leaveChat(); } },
       { icon: 'more', label: '菜单', on: function () { chatMenu(); } }
+    ], [
+      { icon: 'menu', label: '会话列表', on: openDrawer }
     ]));
     var st = statsText(cur);
     var line = el('div', 'statline', st);
     if (!st) line.style.display = 'none';
     frag.appendChild(line);
+    var wrap = el('div', 'chatwrap');
     var log = el('div', 'scroll log');
-    frag.appendChild(log);
+    wrap.appendChild(log);
+    var jump = el('button', 'jumpbtn');
+    jump.setAttribute('aria-label', '回到最新');
+    jump.appendChild(icon('down', 18));
+    jump.addEventListener('click', function () { log.scrollTop = log.scrollHeight; });
+    wrap.appendChild(jump);
+    frag.appendChild(wrap);
+    chatRefs.jump = jump;
+    log.addEventListener('scroll', function () {
+      var away = log.scrollHeight - log.scrollTop - log.clientHeight > 220;
+      jump.classList.toggle('on', away);
+    }, { passive: true });
     frag.appendChild(composer());
     mount(frag);
     chatRefs.log = log;
     chatRefs.statline = line;
     renderedCount = 0;
     renderChat(true);
+  }
+
+  /** Left drawer: the desktop's persistent session sidebar, folded away on a phone. */
+  function openDrawer() {
+    if (S.drawer) { closeDrawer(); return; }
+    var back = el('div', 'drawer-back');
+    var box = el('div', 'drawer');
+
+    var head = el('div', 'dhead');
+    head.appendChild(el('h2', null, '会话'));
+    var nw = el('button', 'iconbtn');
+    nw.setAttribute('aria-label', '新会话');
+    nw.appendChild(icon('plus', 19));
+    nw.addEventListener('click', function () { closeDrawer(); newSession(); });
+    head.appendChild(nw);
+    var cl = el('button', 'iconbtn');
+    cl.setAttribute('aria-label', '关闭');
+    cl.appendChild(icon('back', 19));
+    cl.addEventListener('click', closeDrawer);
+    head.appendChild(cl);
+    box.appendChild(head);
+
+    var sb = el('div', 'dsearch');
+    var q = document.createElement('input');
+    q.type = 'search';
+    q.placeholder = '搜索会话';
+    q.value = S.drawerQuery || '';
+    sb.appendChild(q);
+    box.appendChild(sb);
+
+    var list = el('div', 'dlist');
+    box.appendChild(list);
+
+    function paint() {
+      list.innerHTML = '';
+      var qs = (S.drawerQuery || '').trim().toLowerCase();
+      var live = S.sessions.filter(function (x) { return !isArchived(x.sessionId); });
+      if (qs) {
+        live = live.filter(function (x) {
+          var t = (x.projections && x.projections.values && (x.projections.values.title || '')) || '';
+          return t.toLowerCase().indexOf(qs) >= 0 || (x.cwd || '').toLowerCase().indexOf(qs) >= 0;
+        });
+      }
+      var pin = [], rest = [];
+      live.forEach(function (x) { (isPinned(x.sessionId) ? pin : rest).push(x); });
+      var rows = pin.concat(rest);
+      if (!rows.length) { list.appendChild(el('div', 'empty', S.sessions.length ? '没有匹配的会话' : '正在读取…')); return; }
+      // one block per workspace: the input is already newest-first, so remember the
+      // first-seen order of directories and keep each directory's own ordering.
+      var order = [], byCwd = {};
+      rows.forEach(function (x) {
+        var k = x.cwd || '';
+        if (!byCwd[k]) { byCwd[k] = []; order.push(k); }
+        byCwd[k].push(x);
+      });
+      var grouped = [];
+      order.forEach(function (k) { grouped.push({ cwd: k, items: byCwd[k] }); });
+      var lastCwd = null;
+      grouped.forEach(function (grp) {
+       list.appendChild(el('div', 'dgroup', baseName(grp.cwd) || grp.cwd || '工作区'));
+       grp.items.forEach(function (x) {
+        var cwd = grp.cwd;
+        var r = el('div', 'drow' + (S.cur && S.cur.id === x.sessionId ? ' cur' : ''));
+        r.appendChild(el('div', 'dot ' + (x.running ? 'run' : 'idle')));
+        var t = (x.projections && x.projections.values && x.projections.values.title)
+          || (x.blank ? '（新会话）' : '（无标题）');
+        var tt = el('div', 'dt', (isPinned(x.sessionId) ? '★ ' : '') + t);
+        r.appendChild(tt);
+        r.appendChild(el('div', 'dm', fmtTime(x.updatedAt)));
+        r.addEventListener('click', function () {
+          closeDrawer();
+          if (!S.cur || S.cur.id !== x.sessionId) openSession(x.sessionId, t);
+        });
+        attachLongPress(r, function () { closeDrawer(); sessionActions(x); });
+        list.appendChild(r);
+       });
+      });
+    }
+    paint();
+    q.addEventListener('input', function () {
+      S.drawerQuery = q.value;
+      paint();
+    });
+
+    var foot = el('div', 'dfoot');
+    [['工作区', function () { closeDrawer(); openPanel('workspace'); }],
+     ['归档箱', function () { closeDrawer(); archiveBox(); }],
+     ['设置', function () { closeDrawer(); S.view = 'settings'; render(); }]].forEach(function (b) {
+      var btn = el('button', 'kbtn', b[0]);
+      btn.addEventListener('click', b[1]);
+      foot.appendChild(btn);
+    });
+    box.appendChild(foot);
+
+    back.appendChild(box);
+    back.addEventListener('click', function (ev) { if (ev.target === back) closeDrawer(); });
+    document.body.appendChild(back);
+    S.drawer = back;
+    requestAnimationFrame(function () { back.classList.add('in'); });
+  }
+
+  function closeDrawer() {
+    var back = S.drawer;
+    S.drawer = null;
+    if (!back) return;
+    back.classList.remove('in');
+    setTimeout(function () { back.remove(); }, 200);
   }
 
   function leaveChat() {
@@ -855,8 +984,35 @@
     setTimeout(function () { document.addEventListener('click', function h() { sheet.remove(); document.removeEventListener('click', h); }); }, 0);
   }
 
+  /** Clipboard with three fallbacks: the Android bridge, the async API, then execCommand. */
   function copy(t) {
-    try { navigator.clipboard.writeText(t); toast('已复制'); } catch (e) { toast(t); }
+    var text = String(t == null ? '' : t);
+    try {
+      if (window.DSHMAndroid && window.DSHMAndroid.copy) { window.DSHMAndroid.copy(text); toast('已复制'); return true; }
+    } catch (e) {}
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text);
+        toast('已复制');
+        return true;
+      }
+    } catch (e) {}
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      var ok = document.execCommand('copy');
+      ta.remove();
+      if (ok) { toast('已复制'); return true; }
+    } catch (e) {}
+    toast(text.length > 120 ? text.slice(0, 120) + '…' : text);
+    return false;
   }
 
   function renameCur() {
@@ -1359,6 +1515,8 @@
     chart: 'M4 20V10M10 20V4M16 20v-7M22 20H2',
     command: 'M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z',
   refresh: 'M20.5 12a8.5 8.5 0 1 1-2.9-6.4M21 4v5.5h-5.5',
+  menu: 'M4 7h16M4 12h16M4 17h16',
+  down: 'M12 5v14M5 12l7 7 7-7',
   star: 'M12 3.5l2.6 5.4 5.9.8-4.3 4.1 1.1 5.9-5.3-2.9-5.3 2.9 1.1-5.9L3.5 9.7l5.9-.8z',
   archive: 'M3.5 7.5h17M5.5 7.5V19a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7.5M9.5 7.5v-2a2 2 0 0 1 2-2h1a2 2 0 0 1 2 2v2M10 12.5h4'
   };
@@ -1668,7 +1826,7 @@
     if (kind === 'files' && !S.files) S.files = { path: '', entries: null, inflight: false, error: '' };
     if (kind === 'jobs') S.jobs = null;
     if (kind === 'goal') S.goal = null;
-    if (kind === 'sched' && !S.sched) S.sched = { scope: S.cur ? 'session' : 'all', items: null, error: '', loading: false };
+    if (kind === 'sched') S.sched = { filter: S.sched ? S.sched.filter : null, items: null, error: '', loading: false, total: 0 };
     if (kind === 'workspace') wsEnsure();
     if (kind === 'skills') S.skills = null;
     render();
@@ -1886,18 +2044,21 @@
 
   // ---------- terminal
   //
-  // Protocol (verified live 2026-11-07 against dsh 0.2.0-rc.2, see docs/NEXT.md):
-  //   environment(agentId) -> {cwd,maxInputBytes,maxCols,maxRows,scrollback}
+  // Protocol (verified live 2026-11-10 against dsh 0.2.2-rc.1):
+  //   environment(agentId) -> {cwd,maxInputBytes,maxBufferedBytes,maxCols,maxRows,scrollback}
   //   shells(agentId)      -> [{path,name,args}]
   //   list(sessionId)      -> WebTerminalInfo[]          (note: sessionId, not agentId)
   //   create(agentId,{id,shellPath?,cols,rows}) -> WebTerminalInfo   (id is client-minted, idempotent)
   //   retain(sessionId,id) stream -> [{type:'retained'}]  (physical window hold; stops idle reaping)
-  //   follow(agentId,id,attachmentId) stream -> {type:'snapshot',sequence,screen,info}
-  //                                             {type:'output',sequence,data}
-  //                                             {type:'state',info}
-  //   write(agentId,id,attachmentId,data) | resize(agentId,id,attachmentId,cols,rows)
+  //   attach(agentId,id) BIDIRECTIONAL stream:
+  //     down -> {type:'snapshot',sequence,screen,info,writable,inputWindow?}
+  //             {type:'output',sequence,data} | {type:'state',info,writable}
+  //             {type:'ack',sequence,refusal?}
+  //     up   -> {type:'write',sequence,data} | {type:'resize',sequence,cols,rows}
+  //            sent as {type:'item', streamId, value}; sequences run 1,2,3… per attachment.
   //   close(agentId,id) | rename(agentId,id,title)
-  // Attaching always hands input control to the newest attachment (info.controllerId).
+  // 0.2.2 removed terminal/follow, terminal/write and terminal/resize — input and resize
+  // ride the attach stream, and "am I allowed to type" is the frame's own `writable`.
   // The screen snapshot is @xterm/addon-serialize output, so we must run the same
   // xterm version the host uses (6.0.0) — loaded lazily from assets on first open.
   var xtermLoad = null;
@@ -2050,7 +2211,7 @@
     if (S.term && S.term.page && S.term.page.parentNode) return;
     var st = S.term = {
       sid: S.cur.id, id: null, info: null, env: null, shells: [], term: null, fit: null,
-      followId: null, retainId: null, attachmentId: null, lastSeq: null,
+      followId: null, retainId: null, lastSeq: null, upSeq: 0,
       status: 'connecting', error: '', writable: false, disposed: false, q: Promise.resolve(),
       sentCols: 0, sentRows: 0
     };
@@ -2102,9 +2263,9 @@
     if (cols === st.sentCols && rows === st.sentRows) return;
     if (!st.writable) return;
     st.sentCols = cols; st.sentRows = rows;
-    rpc('terminal/resize', { agentId: st.sid, id: st.id, attachmentId: st.attachmentId, cols: cols, rows: rows })
-      .catch(function () { st.sentCols = 0; st.sentRows = 0; });
+    if (!termSend(st, { type: 'resize', cols: cols, rows: rows })) { st.sentCols = 0; st.sentRows = 0; }
   }
+
 
   function termBoot(st) {
     var sid = st.sid;
@@ -2144,7 +2305,7 @@
     var m = S.mux;
     if (st.followId && m) m.closeStream(st.followId);
     if (st.retainId && m) m.closeStream(st.retainId);
-    st.followId = null; st.retainId = null; st.attachmentId = null; st.lastSeq = null;
+    st.followId = null; st.retainId = null; st.lastSeq = null; st.upSeq = 0;
   }
 
   /** (Re)attach: fresh snapshot + input control; the process itself is untouched. */
@@ -2155,13 +2316,14 @@
     st.status = 'connecting';
     st.writable = false;
     st.sentCols = 0; st.sentRows = 0;
+    st.upSeq = 0;
+    st.acks = [];
     termStatus(st);
     var m = mux();
-    st.attachmentId = uuid();
     st.retainId = m.open('terminal/retain', { sessionId: st.sid, id: st.id }, {
       onFrame: function () {}, onEnd: function () {}, onError: function () {}
     });
-    st.followId = m.open('terminal/follow', { agentId: st.sid, id: st.id, attachmentId: st.attachmentId }, {
+    st.followId = m.open('terminal/attach', { agentId: st.sid, id: st.id }, {
       onFrame: function (f) { termFrame(st, f); },
       onEnd: function () {
         if (st.disposed) return;
@@ -2177,13 +2339,24 @@
     if (forceNew && st.term) { try { st.term.reset(); } catch (e) {} }
   }
 
+  /** One uplink command; sequences are consecutive from 1 within each attachment. */
+  function termSend(st, input) {
+    if (!st || st.disposed || !st.followId) return false;
+    st.upSeq = (st.upSeq || 0) + 1;
+    input.sequence = st.upSeq;
+    var sent = mux().push(st.followId, input);
+    if (!sent) st.upSeq -= 1;
+    return sent;
+  }
+
+
   function termFrame(st, f) {
     if (st.disposed || !st.term || !f) return;
     if (f.type === 'snapshot') {
       st.lastSeq = f.sequence;
       st.info = f.info;
+      st.writable = !!f.writable;
       st.status = f.info.state === 'running' ? 'connected' : f.info.state;
-      st.writable = f.info.state === 'running' && f.info.controllerId === st.attachmentId;
       st.error = '';
       try { st.term.reset(); } catch (e) {}
       if (f.screen) st.term.write(f.screen);
@@ -2199,11 +2372,19 @@
     }
     if (f.type === 'state') {
       st.info = f.info;
+      st.writable = !!f.writable;
       st.status = f.info.state === 'running' ? 'connected' : f.info.state;
-      st.writable = f.info.state === 'running' && f.info.controllerId === st.attachmentId;
       termStatus(st);
+      return;
+    }
+    if (f.type === 'ack') {
+      if (f.refusal) {
+        st.writable = false;
+        termFail(st, f.refusal === 'read-only' ? '输入被拒绝：另一个窗口持有控制权' : '进程已结束');
+      }
     }
   }
+
 
   function termWrite(st, data) {
     if (!st || st.disposed || !st.id) return;
@@ -2212,11 +2393,11 @@
       toast('终端当前只读，菜单里“重新连接”可取回输入权');
       return;
     }
-    var args = { agentId: st.sid, id: st.id, attachmentId: st.attachmentId, data: data };
-    st.q = st.q.then(function () { return rpc('terminal/write', args); }).catch(function (e) {
-      termFail(st, termErrText(e));
+    st.q = st.q.then(function () {
+      if (!termSend(st, { type: 'write', data: data })) termFail(st, '输入通道已断开');
     });
   }
+
 
   function termLine(st, text) {
     if (!text) { termWrite(st, '\r'); return; }
@@ -2325,16 +2506,16 @@
     });
   }
 
-  // ---------- schedules (定时任务)
+  // ---------- schedules (定时任务) — dsh 0.2.2 API
   //
-  // Verified 2026-11-07: every schedule/* and workspace/* method takes ONE parameter
-  // named `request` — args = {request:{...}}. Flat args fail with
-  // `missing "request"; unexpected "<field>"`.
-  //   schedule/catalog()                      -> ScheduleCatalogEntry[] (host-wide)
-  //   schedule/list({sessionId})              -> ScheduleRecord[]
-  //   schedule/delete({sessionId, id})        -> {id, deleted}
-  //   schedule/update({sessionId, id, expected, title?, prompt?, change?})
-  //   schedule/history({sessionId, id, limit, before?})
+  // Verified 2026-11-10 on 0.2.2-rc.1:
+  //   schedule/list({active?,limit?,offset?}) -> {items,shown,total,limit,offset}   (Host-wide)
+  //   schedule/create({title,prompt,timing,target?}) -> ScheduleCatalogEntry
+  //   schedule/edit({id, action:'update', patch:{title?,prompt?,timing?,target?,active?}, expectedUpdatedAt?})
+  //   schedule/edit({id, action:'delete'})
+  //   schedule/run({id}) | schedule/view({id}) | schedule/deleteInactive()
+  // 0.2.2 replaced the old daily/weekly/cron records with RFC-5545 `kind:'rrule'` rows and
+  // added status active|paused|ended; legacy `after` rows still show up.
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
   function fmtClock(iso) {
@@ -2364,39 +2545,67 @@
   }
 
   var WEEK_CN = ['一', '二', '三', '四', '五', '六', '日'];
+  var RRULE_FREQ = { SECONDLY: '每秒', MINUTELY: '每分钟', HOURLY: '每小时', DAILY: '每天', WEEKLY: '每周', MONTHLY: '每月', YEARLY: '每年' };
 
-  /** Human description of a schedule rule (ScheduleRecord is a kind-discriminated union). */
-  function schedRule(r) {
-    if (!r) return '';
-    switch (r.kind) {
-      case 'after': return '延时 ' + fmtDur(r.afterSeconds);
+  /** Human reading of one RFC-5545 rule line plus its DTSTART anchor. */
+  function prettyRRule(rrule) {
+    if (!rrule) return '';
+    var text = String(rrule);
+    var dt = /DTSTART(?:;[^:]*)?:(\d{8})T(\d{6})/.exec(text);
+    var clock = dt ? dt[2].slice(0, 2) + ':' + dt[2].slice(2, 4) : '';
+    var rule = /RRULE:([^\n]+)/.exec(text);
+    if (!rule) return clock ? '从 ' + clock + ' 开始' : text.slice(0, 40);
+    var parts = {};
+    rule[1].split(';').forEach(function (kv) {
+      var i = kv.indexOf('=');
+      if (i > 0) parts[kv.slice(0, i)] = kv.slice(i + 1);
+    });
+    var freq = RRULE_FREQ[parts.FREQ] || (parts.FREQ || '');
+    var every = Number(parts.INTERVAL || 1);
+    var out = every > 1 ? '每 ' + every + ' ' + (RRULE_FREQ[parts.FREQ] || '').replace(/^每/, '') : freq;
+    if (parts.BYDAY) {
+      var days = parts.BYDAY.split(',').map(function (d) {
+        var m = /^(-?\d)?(MO|TU|WE|TH|FR|SA|SU)$/.exec(d);
+        if (!m) return d;
+        var w = WEEK_CN[['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'].indexOf(m[2])];
+        return w ? (m[1] ? '第' + m[1] + '个周' + w : '周' + w) : d;
+      }).join('、');
+      if (/^(每天|每周)$/.test(out)) out = '每' + days;
+      else out += ' ' + days;
+    }
+    if (clock && !/每(秒|分钟)/.test(out)) out += ' ' + clock;
+    if (parts.COUNT) out += '（共 ' + parts.COUNT + ' 次）';
+    else if (parts.UNTIL) out += '（到 ' + String(parts.UNTIL).slice(0, 8) + '）';
+    return out;
+  }
+
+  function schedRule(it) {
+    if (!it) return '';
+    switch (it.kind) {
+      case 'rrule': return prettyRRule(it.rrule);
+      case 'after': return '延时 ' + fmtDur(it.afterSeconds || it.after_seconds || 0);
       case 'at': return '一次性';
-      case 'every': return '每 ' + fmtDur(r.everySeconds);
-      case 'daily': return '每天 ' + String(r.time || '').slice(0, 5);
-      case 'weekly': return '每周' + (r.weekdays || []).map(function (w) { return WEEK_CN[w - 1] || w; }).join('') + ' ' + String(r.time || '').slice(0, 5);
-      case 'cron': return 'cron ' + (r.expression || '');
-      default: return r.kind || '';
+      case 'every': return '每 ' + fmtDur(it.everySeconds || it.every_seconds || 0);
+      case 'daily': return '每天 ' + String(it.time || (it.daily && it.daily.time) || '').slice(0, 5);
+      case 'weekly': return '每周';
+      case 'cron': return 'cron ' + (it.expression || (it.cron && it.cron.expression) || '');
+      default: return it.kind || '';
     }
   }
 
-  function schedZone(r) {
-    if (!r) return '';
-    if (r.timeZone) return r.timeZone;
-    if (r.daily && r.daily.time_zone) return r.daily.time_zone;
-    return '';
-  }
+  var SCHED_STATUS = { active: '运行中', paused: '已暂停', ended: '已结束' };
+
+  function schedStatus(it) { return SCHED_STATUS[it && it.status] || (it && it.status) || ''; }
 
   function renderSchedule() {
-    var st = S.sched || (S.sched = { scope: S.cur ? 'session' : 'all', items: null, error: '', loading: false });
-    if (st.scope === 'session' && !S.cur) { st.scope = 'all'; st.items = null; }
+    var st = S.sched || (S.sched = { filter: null, items: null, error: '', loading: false, total: 0 });
     var frag = document.createDocumentFragment();
-    var title = st.scope === 'all' ? '全部定时任务' : '定时任务';
-    frag.appendChild(panelHeader(title, [
+    frag.appendChild(panelHeader('定时任务', [
+      { icon: 'plus', label: '新建任务', on: function () { schedCreateSheet(); } },
       { icon: 'refresh', label: '刷新', on: function () { st.items = null; renderSchedule(); } },
-      { icon: 'more', label: '范围', on: function () { schedScopeSheet(st); } }
+      { icon: 'more', label: '更多', on: function () { schedMenu(st); } }
     ]));
-    var line = el('div', 'statline', st.scope === 'all' ? '本机所有会话 · 点右上角切换' : '仅当前会话 · 点右上角切换');
-    frag.appendChild(line);
+    frag.appendChild(el('div', 'statline', st.total ? st.total + ' 个任务' + (st.filter === true ? '（仅运行中）' : st.filter === false ? '（仅已停止）' : '（全部）') : '本机所有会话的定时任务'));
     var sc = el('div', 'scroll');
     var box = el('div', 'pane');
     sc.appendChild(box);
@@ -2406,11 +2615,11 @@
     if (st.items === null && !st.loading) {
       st.loading = true;
       box.appendChild(el('div', 'empty', '<span class="spin-sm"></span> 读取中…'));
-      var p = st.scope === 'all'
-        ? rpc('schedule/catalog', {})
-        : rpc('schedule/list', { request: { sessionId: S.cur.id } });
-      p.then(function (v) {
-        st.items = v || [];
+      var req = {};
+      if (st.filter === true || st.filter === false) req.active = st.filter;
+      rpc('schedule/list', { request: req }).then(function (v) {
+        st.items = (v && v.items) || [];
+        st.total = (v && v.total) || 0;
         st.error = '';
       }).catch(function (e) {
         st.items = [];
@@ -2425,70 +2634,168 @@
     box.innerHTML = '';
     if (st.error) box.appendChild(el('div', 'hint', st.error));
     if (!st.items || !st.items.length) {
-      box.appendChild(el('div', 'empty', st.scope === 'all'
-        ? '本机还没有任何定时任务。让模型用 schedule_create 建一个，或直接在对话里说“10 分钟后提醒我…”。'
-        : '这个会话没有定时任务。定时任务通常由模型用 schedule_create 创建。'));
+      box.appendChild(el('div', 'empty', '没有定时任务。点右上角 + 新建，或直接跟模型说“20 分钟后提醒我…”'));
       return;
     }
-    st.items.slice().sort(function (a, b) { return String(a.scheduledAt || '').localeCompare(String(b.scheduledAt || '')); })
-      .forEach(function (it) {
-        var row = el('div', 'row');
-        var dot = el('div', 'dot ' + (it.status === 'inactive' ? 'idle' : 'run'));
-        row.appendChild(dot);
-        var g = el('div', 'grow');
-        g.appendChild(el('div', 't', it.title || '（无标题任务）'));
-        var m = el('div', 'm');
-        m.appendChild(el('span', null, schedRule(it) + (schedZone(it) ? ' · ' + schedZone(it) : '')));
-        g.appendChild(m);
-        if (it.prompt) {
-          var mp = el('div', 'm');
-          mp.appendChild(el('span', 'snip', truncate(String(it.prompt).replace(/\s+/g, ' '), 60)));
-          g.appendChild(mp);
-        }
-        var m2 = el('div', 'm');
-        var nxt = el('span', null, fmtClock(it.scheduledAt) + '（' + relText(it.scheduledAt) + '）');
-        if (it.status === 'inactive') nxt.textContent = '已停止';
-        m2.appendChild(nxt);
-        if (st.scope === 'all' && it.sessionId) {
-          var tag = el('span', 'path', String(it.sessionId).slice(8, 16));
-          m2.appendChild(tag);
-        }
-        g.appendChild(m2);
-        row.appendChild(g);
-        row.addEventListener('click', function () { schedDetail(it, st); });
-        box.appendChild(row);
-      });
+    st.items.forEach(function (it) {
+      var row = el('div', 'row');
+      row.appendChild(el('div', 'dot ' + (it.status === 'active' ? 'run' : 'idle')));
+      var g = el('div', 'grow');
+      g.appendChild(el('div', 't', it.title || '（无标题任务）'));
+      var m1 = el('div', 'm');
+      m1.appendChild(el('span', null, schedRule(it) + ' · ' + schedStatus(it)));
+      g.appendChild(m1);
+      var m2 = el('div', 'm');
+      var when = it.status === 'ended' ? '已结束' : fmtClock(it.scheduledAt) + '（' + relText(it.scheduledAt) + '）';
+      m2.appendChild(el('span', null, when));
+      var tgt = it.target && (it.target.sessionId || it.target.kind);
+      if (tgt) m2.appendChild(el('span', 'path', String(tgt).slice(0, 14)));
+      g.appendChild(m2);
+      row.appendChild(g);
+      row.addEventListener('click', function () { schedDetail(it, st); });
+      box.appendChild(row);
+    });
   }
 
-  function schedScopeSheet(st) {
-    sheet('范围', function (body, close) {
-      body.appendChild(sheetRow('当前会话', S.cur ? ((S.cur.projections && S.cur.projections.title) || S.cur.id) : '未打开会话',
-        function () { close(); st.scope = 'session'; st.items = null; renderSchedule(); }, { active: st.scope === 'session' }));
-      body.appendChild(sheetRow('全部会话', 'schedule/catalog()，本机所有定时任务', function () {
-        close(); st.scope = 'all'; st.items = null; renderSchedule();
-      }, { active: st.scope === 'all' }));
+  function schedMenu(st) {
+    sheet('定时任务', function (body, close) {
+      body.appendChild(sheetRow('新建任务', '到点让某个会话自动发起一轮', function () { close(); schedCreateSheet(); }));
+      body.appendChild(el('div', 'sheet-sep', '筛选'));
+      body.appendChild(sheetRow('全部', '', function () { close(); st.filter = null; st.items = null; renderSchedule(); }, { active: st.filter === null }));
+      body.appendChild(sheetRow('仅运行中', '', function () { close(); st.filter = true; st.items = null; renderSchedule(); }, { active: st.filter === true }));
+      body.appendChild(sheetRow('仅已停止 / 已结束', '', function () { close(); st.filter = false; st.items = null; renderSchedule(); }, { active: st.filter === false }));
+      body.appendChild(el('div', 'sheet-sep', '清理'));
+      body.appendChild(sheetRow('删除所有已结束任务', 'schedule/deleteInactive，不可恢复', function () {
+        close();
+        rpc('schedule/deleteInactive', {}).then(function (v) {
+          toast('已删除 ' + ((v && v.deleted) || 0) + ' 个已结束任务');
+          st.items = null;
+          if (S.view === 'sched') renderSchedule();
+        }).catch(function (e) { toast('失败：' + e.message); });
+      }));
     });
   }
 
   function schedDetail(it, st) {
     sheet(it.title || '定时任务', function (body, close) {
       body.appendChild(el('div', 'sheet-note', it.prompt || '（没有提醒内容）'));
-      body.appendChild(sheetRow('规则', schedRule(it) + (schedZone(it) ? ' · ' + schedZone(it) : ''), function () {}));
-      body.appendChild(sheetRow('下次触发', fmtClock(it.scheduledAt) + '（' + relText(it.scheduledAt) + '）', function () {}));
-      if (it.status) body.appendChild(sheetRow('状态', it.status === 'active' ? '运行中' : '已停止', function () {}));
-      if (it.lastDelivery) body.appendChild(sheetRow('最近投递', fmtClock(it.lastDelivery.deliveredAt || '') || '有记录', function () {}));
+      body.appendChild(sheetRow('规则', schedRule(it), function () {}));
+      body.appendChild(sheetRow('状态', schedStatus(it) + (it.scheduledAt && it.status !== 'ended' ? ' · 下次 ' + fmtClock(it.scheduledAt) + '（' + relText(it.scheduledAt) + '）' : ''), function () {}));
+      if (it.lastDelivery) body.appendChild(sheetRow('最近投递', fmtClock(it.lastDelivery.deliveredAt || '') + (it.lastDelivery.targetSessionId ? ' · ' + String(it.lastDelivery.targetSessionId).slice(8, 18) : ''), function () {}));
+      var tgt = it.target && it.target.sessionId;
+      if (tgt) body.appendChild(sheetRow('投递到会话', String(tgt), function () { close(); openSession(tgt, ''); }));
+      body.appendChild(sheetRow('立即执行一次', 'schedule/run，不等下次触发', function () {
+        close();
+        rpc('schedule/run', { request: { id: it.id } }).then(function (v) {
+          if (v && v.code === 'schedule_execution_pending') toast('这一轮已经在跑了');
+          else toast('已触发');
+          st.items = null;
+          if (S.view === 'sched') renderSchedule();
+        }).catch(function (e) { toast('触发失败：' + e.message); });
+      }));
+      if (it.status === 'active') {
+        body.appendChild(sheetRow('暂停', '暂停后不再触发，可再恢复', function () {
+          close(); schedPatch(it, st, { active: false }, '已暂停');
+        }));
+      } else if (it.status === 'paused') {
+        body.appendChild(sheetRow('恢复', '从下一个未来时刻继续', function () {
+          close(); schedPatch(it, st, { active: true }, '已恢复');
+        }));
+      }
       body.appendChild(sheetRow('复制任务 ID', String(it.id), function () { close(); copy(String(it.id)); }));
       body.appendChild(el('div', 'sheet-sep', '危险操作'));
-      body.appendChild(sheetRow('删除这个定时任务', '只删任务；已投递的消息留在会话里', function () {
+      body.appendChild(sheetRow('删除这个任务', '连同它的投递记录一起删除', function () {
         close();
-        var sid = it.sessionId || (S.cur && S.cur.id);
-        rpc('schedule/delete', { request: { sessionId: sid, id: it.id } }).then(function (v) {
-          if (v && v.deleted === false) { toast('任务已不存在'); return; }
+        rpc('schedule/edit', { request: { id: it.id, action: 'delete' } }).then(function () {
           toast('已删除');
           st.items = null;
           if (S.view === 'sched') renderSchedule();
         }).catch(function (e) { toast('删除失败：' + e.message); });
       }));
+    });
+  }
+
+  function schedPatch(it, st, patch, okMsg) {
+    rpc('schedule/edit', { request: { id: it.id, action: 'update', patch: patch, expectedUpdatedAt: it.updatedAt || null } })
+      .then(function (v) {
+        if (v && v.code === 'schedule_conflict') { toast('任务刚被改过，已刷新'); }
+        else toast(okMsg);
+        st.items = null;
+        if (S.view === 'sched') renderSchedule();
+      }).catch(function (e) { toast('失败：' + e.message); });
+  }
+
+  /** Small create form: title + instruction + one timing selector, delivered to this session. */
+  function schedCreateSheet() {
+    var zone = tz();
+    var mode = { v: 'after' };
+    sheet('新建定时任务', function (body, close) {
+      var titleIn = document.createElement('input');
+      titleIn.className = 'terminput'; titleIn.style.width = '100%';
+      titleIn.placeholder = '任务名（必填，≤120 字）';
+      var promptIn = document.createElement('textarea');
+      promptIn.className = 'terminput'; promptIn.style.width = '100%';
+      promptIn.style.marginTop = '8px'; promptIn.style.minHeight = '70px';
+      promptIn.placeholder = '到点要发给模型的指令';
+      var timeIn = document.createElement('input');
+      timeIn.className = 'terminput'; timeIn.style.width = '100%';
+      timeIn.style.marginTop = '8px';
+      timeIn.placeholder = '延时分钟数，例如 30';
+
+      var modes = el('div', 'termkeys');
+      modes.style.padding = '8px 0 0';
+      [['after', '延时'], ['daily', '每天'], ['cron', 'cron']].forEach(function (m) {
+        var b = el('button', 'kbtn', m[1]);
+        b.addEventListener('click', function () {
+          mode.v = m[0];
+          Array.prototype.forEach.call(modes.children, function (c) { c.classList.remove('primary'); });
+          b.classList.add('primary');
+          timeIn.placeholder = m[0] === 'after' ? '延时分钟数，例如 30'
+            : m[0] === 'daily' ? '每天的时刻 HH:MM，例如 08:30'
+              : 'cron 表达式，例如 0 9 * * 1-5';
+        });
+        if (m[0] === 'after') b.classList.add('primary');
+        modes.appendChild(b);
+      });
+
+      body.appendChild(titleIn);
+      body.appendChild(promptIn);
+      body.appendChild(modes);
+      body.appendChild(timeIn);
+      body.appendChild(el('div', 'sheet-note', '时区 ' + zone + ' · 投递到当前会话'));
+
+      var btn = el('button', 'kbtn primary', '创建');
+      btn.style.marginTop = '10px'; btn.style.width = '100%';
+      btn.addEventListener('click', function () {
+        var title = titleIn.value.trim();
+        var prompt = promptIn.value.trim();
+        var t = timeIn.value.trim();
+        if (!title) { toast('任务名必填'); return; }
+        if (!prompt) { toast('指令必填'); return; }
+        var timing;
+        if (mode.v === 'after') {
+          var mins = Number(t);
+          if (!isFinite(mins) || mins <= 0) { toast('填个正数分钟'); return; }
+          timing = { kind: 'after', after_seconds: Math.round(mins * 60) };
+        } else if (mode.v === 'daily') {
+          if (!/^\d{1,2}:\d{2}$/.test(t)) { toast('时刻要写成 HH:MM'); return; }
+          timing = { kind: 'daily', daily: { time: t + ':00', time_zone: zone } };
+        } else {
+          if (t.split(/\s+/).length < 5) { toast('cron 要 5 段'); return; }
+          timing = { kind: 'cron', cron: { expression: t, time_zone: zone } };
+        }
+        var target = S.cur ? { kind: 'session', sessionId: S.cur.id } : undefined;
+        var req = { title: title, prompt: prompt, timing: timing };
+        if (target) req.target = target;
+        close();
+        rpc('schedule/create', { request: req }).then(function () {
+          toast('已创建');
+          if (S.sched) S.sched.items = null;
+          if (S.view === 'sched') renderSchedule();
+        }).catch(function (e) { toast('创建失败：' + e.message); });
+      });
+      body.appendChild(btn);
+      setTimeout(function () { try { titleIn.focus(); } catch (e) {} }, 60);
     });
   }
 
@@ -3065,8 +3372,15 @@
     });
   }
 
-  function header(title, sub, actions) {
+  function header(title, sub, actions, leading) {
     var h = el('div', 'hdr');
+    (leading || []).forEach(function (a) {
+      var b = el('button', 'iconbtn');
+      b.setAttribute('aria-label', a.label);
+      if (ICONS[a.icon]) b.appendChild(icon(a.icon, 19)); else b.textContent = a.icon;
+      b.addEventListener('click', a.on);
+      h.appendChild(b);
+    });
     var t = el('h1');
     t.textContent = title;
     if (sub) { var s = el('span', 'sub'); s.textContent = ' ' + sub; t.appendChild(s); }
@@ -3218,6 +3532,7 @@
 
   /** Android back button: chat → list → settings → exit. */
   function goBack() {
+    if (S.drawer) { closeDrawer(); return 'nav'; }
     if (S.term) { closeTermPage(); return 'nav'; }
     if (S.view === 'chat') { leaveChat(); return 'nav'; }
     if (S.view === 'files' || S.view === 'jobs' || S.view === 'goal' || S.view === 'more' || S.view === 'trajectory' || S.view === 'info') { closePanel(); return 'nav'; }
@@ -3239,6 +3554,14 @@
   }
 
   // ─────────────────────────────────────────────────────────── boot
+  document.addEventListener('click', function (ev) {
+    var b = ev.target && ev.target.closest ? ev.target.closest('.codecopy') : null;
+    if (!b) return;
+    var block = b.closest('.codeblock');
+    var code = block && block.querySelector('code');
+    copy(code ? code.textContent : '');
+  });
+
   function boot() {
     document.documentElement.dataset.theme = S.theme;
     mount(el('div', 'boot'));
@@ -3277,6 +3600,8 @@
     termWrite: termWrite,
     wsState: function () { return S.ws; },
     settingsState: function () { return S.settings; },
+    openDrawer: openDrawer,
+    closeDrawer: closeDrawer,
     skillsState: function () { return S.skills; },
     mutateSetting: mutateSetting,
     pluginSheet: pluginSheet,

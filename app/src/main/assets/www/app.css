@@ -333,3 +333,58 @@ pre code { background: none; padding: 0; font-size: inherit; }
 
 .sheet-sep { margin: 14px 16px 6px; font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
   color: var(--fg-faint); text-transform: uppercase; }
+
+/* ===== desktop-parity UI (2026-11-10) ===== */
+/* assistant replies read as document text like the desktop client, not as a chat bubble */
+.msg.assistant { background: transparent; border: none; padding: 2px 0; }
+.msg.assistant > *:first-child { margin-top: 0; }
+/* tool cards: tighter, desktop-like left rule */
+.tool { border-radius: 10px; }
+.tool > summary { padding: 7px 10px; }
+.tool .body { padding: 8px 10px; }
+
+/* code blocks get a bar with a copy button (desktop has one) */
+.codeblock { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin: 8px 0; background: var(--tool-bg); }
+.codeblock .codebar { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px 8px 4px 10px; border-bottom: 1px solid var(--line); font-size: 11px; color: var(--fg-faint);
+  font-family: ui-monospace, Menlo, Consolas, monospace; }
+.codeblock pre { margin: 0; border: none; border-radius: 0; background: transparent; }
+.codecopy { appearance: none; border: 1px solid var(--line); background: var(--bg-elev2); color: var(--fg-dim);
+  border-radius: 7px; font-size: 11px; padding: 3px 8px; }
+.codecopy:active { background: var(--line); color: var(--fg); }
+
+/* ---------- drawer nav (desktop sidebar counterpart) ---------- */
+.drawer-back { position: fixed; inset: 0; z-index: 45; background: rgba(0,0,0,.42); opacity: 0; transition: opacity .18s ease; }
+.drawer-back.in { opacity: 1; }
+.drawer { position: absolute; top: 0; bottom: 0; left: 0; width: min(86vw, 344px);
+  display: flex; flex-direction: column; background: var(--bg-elev);
+  border-right: 1px solid var(--line); transform: translateX(-100%); transition: transform .2s cubic-bezier(.2,.8,.25,1);
+  padding-top: var(--sat); }
+.drawer-back.in .drawer { transform: none; }
+.drawer .dhead { display: flex; align-items: center; gap: 8px; padding: 12px 12px 8px; }
+.drawer .dhead h2 { font-size: 15px; margin: 0; flex: 1 1 auto; }
+.drawer .dsearch { padding: 0 12px 8px; }
+.drawer .dsearch input { width: 100%; appearance: none; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg); color: var(--fg); font-size: 13px; padding: 8px 10px; outline: none; }
+.drawer .dlist { flex: 1 1 auto; overflow-y: auto; padding: 0 6px 8px; }
+.drawer .dgroup { font-size: 11px; font-weight: 600; letter-spacing: .03em; color: var(--fg-faint);
+  padding: 12px 10px 4px; text-transform: uppercase; }
+.drawer .drow { display: flex; align-items: center; gap: 9px; padding: 9px 10px; border-radius: 10px; }
+.drawer .drow:active { background: var(--bg-elev2); }
+.drawer .drow.cur { background: var(--bg-elev2); }
+.drawer .drow .dt { flex: 1 1 auto; min-width: 0; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.drawer .drow .dm { font-size: 11px; color: var(--fg-faint); flex: 0 0 auto; }
+.drawer .dfoot { border-top: 1px solid var(--line); padding: 8px calc(var(--sab) + 8px) calc(var(--sab) + 8px); display: flex; gap: 6px; flex-wrap: wrap; }
+.drawer .dfoot .kbtn { flex: 1 1 auto; text-align: center; }
+
+/* floating jump-to-latest (desktop keeps the reading column pinned) */
+.jumpbtn { position: absolute; right: 14px; bottom: 14px; z-index: 12;
+  width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line);
+  background: var(--bg-elev2); color: var(--fg); display: grid; place-items: center;
+  box-shadow: 0 4px 14px rgba(0,0,0,.28); opacity: 0; pointer-events: none; transition: opacity .16s ease; }
+.jumpbtn.on { opacity: 1; pointer-events: auto; }
+.chatwrap { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+
+/* panel/page enter animation */
+.pane { animation: paneIn .16s ease-out; }
+@keyframes paneIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }

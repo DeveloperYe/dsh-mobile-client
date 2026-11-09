@@ -2,6 +2,8 @@ package io.github.developerye.dshm;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -114,6 +116,22 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public String getServer() {
             return server();
+        }
+
+        /**
+         * Copy through the platform clipboard. The page is served over plain http, where
+         * "navigator.clipboard" does not exist, so copy actions would silently fail
+         * without this bridge.
+         */
+        @JavascriptInterface
+        public void copy(final String text) {
+            final String value = text == null ? "" : text;
+            runOnUiThread(new Runnable() {
+                public void run() {
+                    ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("DSH", value));
+                }
+            });
         }
 
         @JavascriptInterface

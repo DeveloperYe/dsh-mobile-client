@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.9.0 | **适配 dsh 0.2.2-rc.1**（终端上行流、定时任务新 API + 新建/立即执行/暂停恢复）+ **桌面化 UI**（抽屉侧栏、助手正文去气泡、回到最新浮标、代码块复制）+ 修掉 http 下复制失效的真 bug |
 | 1.8.1 | **滚动三修**：打开会话直接落到最新消息（之前停在最上面）；「载入更早的消息」按高度差补偿，阅读位置不再被打飞；回合结束重绘不再跳回顶部。断言在 `test/scroll-local.mjs` 与 `test/jump-local.mjs` |
 | 1.8.0 | **设置可写**：凭据（9 个 API Key，改/清）、20 个配置项的标量字段编辑（带 revision CAS，过期即拒）、203 个插件清单 + 启停；**技能面板**（`skills/list`，9 个技能，可复制名称/SKILL.md 路径） |
 | 1.7.0 | **定时任务面板**（本会话 / 全部会话两种范围、规则与下次触发、详情、删除）+ **工作区管理**（`workspace/follow` 订阅、置顶、归档箱恢复、改名、登记/删除、按工区看会话、会话长按菜单、主列表隐藏已归档） |
@@ -159,6 +160,24 @@ skills/list({sessionId})                             -> {skills:[{name, descript
   `readOnlyReason`（`unaddressable` / `management-required`）的条目不能开关。命令行验证配置是否仍然合法：
   `dsh --profile web --dump-config`（退出码 0）。
 
+### dsh 0.2.2-rc.1 破坏性变更（2026-11-10 实测）
+
+升到 0.2.2 后，**终端与定时任务两块直接失效**，根因是端点被删/改名：
+
+| 0.2.0-rc.2 | 0.2.2-rc.1 | 处置 |
+|---|---|---|
+| `terminal/follow` + `terminal/write` + `terminal/resize` | **只剩 `terminal/attach`（双向流）** | 上行改成 `{type:'item',streamId,value:{type:'write',sequence,data}}` / `{type:'resize',sequence,cols,rows}`，sequence 每个 attachment 从 1 连续递增；下行新增 `ack` 帧（含 `refusal`）；可写性改读帧里的 `writable`，不再比对 `controllerId` |
+| `schedule/delete` / `schedule/update` | `schedule/edit({id, action:'update'|'delete', patch?, expectedUpdatedAt?})` | 删除= `action:'delete'`；改= patch |
+| `schedule/list` 返回数组 | 返回 `{items,shown,total,limit,offset}`，**全机**+分页（`active?` 过滤） | 面板改为全机列表 + 筛选 |
+| 任务记录 `daily/weekly/cron` 字段 | **`kind:'rrule'` + `rrule` 字符串**，并带 `status: active|paused|ended`、`target`、`lastDelivery`、`createdAt/updatedAt` | 写了个 rrule 人话解析（FREQ/INTERVAL/BYDAY/COUNT + DTSTART 时刻） |
+
+**0.2.2 新增、手机端用得上的**：`schedule/create`（客户端终于能自己建任务）、`schedule/run`（立即执行一次）、`schedule/view`、`schedule/deleteInactive`（批量清理已结束）、`schedule/deliveryLimits`。
+**其他新增但本轮没接**：`session/updateQueue`（回合中排队消息）、`actionCards/act`（模型给的可点卡片）、`speech/*`（语音输入，experimental）、`messageFeedback/*`、`workspaceFiles/changes`、`fileReferences/list`、`llm/discoverModels`、`pluginMarket/*`、`forgePanel/*`、`remoteAccess/follow`。
+
+**不变的部分**：`approval/request` 与 `user-questions/request` 两个 waterfall 名字和行为没动，`$events` 契约照旧；`session/follow`、`terminal/retain`、`workspace/follow`、`settings/*`、`credentials/*`、`skills/list`、`workspaceFiles/*` 都没变。
+
+**环境变化**：3080 现在只绑 `172.16.0.59`（公网 `36.138.189.24:3080` 仍可达，靠端口转发），新增 `8443` TLS 只绑内网、公网连不上；升级后登录 cookie 全部失效，测试台状态要用 `tools/refresh-state.mjs` 重新抓。
+
 ### 踩过的坑（都值得保留）
 
 1. **明文 HTTP 下没有 `crypto.randomUUID`**（secure context 限制），需自备 polyfill；`crypto.getRandomValues` 可用。
@@ -168,7 +187,8 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 5. **登录前建立的 WebSocket 会被 403**，登录成功后必须重建 mux 并重新订阅 `$events`。
 6. **会话快照到达后要重绘输入区**，否则模型/权限 chip 不出现。
 7. `renderFiles` 与 `loadDir` 写成互相调用会爆栈——必须单向：渲染发现未加载才触发加载。
-8. 本机 `github.com:443` 不通，推送走 `.github`/`work` 里的 Git Data API 脚本；`dl.google.com`、Maven Central 可达（CI 在 ubuntu runner 上编译，本机不装 Android SDK）。
+8. **明文 http 下 `navigator.clipboard` 根本不存在**（0.2.2 升级后才发现「复制」一直是坏的：点了只弹文本、没进剪贴板）。修法：优先走原生桥 `window.DSHMAndroid.copy()`（MainActivity 里用 ClipboardManager），再退 `navigator.clipboard`、再退 `document.execCommand('copy')`。
+9. 本机 `github.com:443` 不通，推送走 `.github`/`work` 里的 Git Data API 脚本；`dl.google.com`、Maven Central 可达（CI 在 ubuntu runner 上编译，本机不装 Android SDK）。
 
 ## 测试台
 
@@ -187,6 +207,10 @@ test/harness-sched-ws.mjs  定时任务 + 工作区：15 项断言（--skip-agen
 test/cleanup-harness-sessions.mjs 归档测试里新建的临时会话
 test/probe-settings.mjs / probe-settings-write.mjs / probe-settings-shape.mjs  设置读写语义探针
 test/harness-settings.mjs  设置可写 + 插件 + 技能：12 项断言（含真实写入与精确还原）
+test/probe-022.mjs         0.2.2 协议探针（terminal/attach 双向 + schedule 新结构）
+test/harness-sched22.mjs   定时任务 0.2.2：列表/表单新建/暂停/恢复/删除，9 项断言
+test/harness-ui.mjs        桌面化 UI：抽屉/切换/搜索/去气泡/回到底部/代码复制/返回键，12 项断言
+tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）
 test/measure.mjs      冷/热启动首帧耗时
 ```
 
