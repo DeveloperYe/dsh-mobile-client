@@ -14,7 +14,7 @@
   'use strict';
 
   // ─────────────────────────────────────────────────────────── utilities
-  var K = { server: 'dshm.server', pass: 'dshm.pass', theme: 'dshm.theme', cache: 'dshm.cache', cwd: 'dshm.cwd', inject: 'dshm.inject' };
+  var K = { server: 'dshm.server', pass: 'dshm.pass', theme: 'dshm.theme', cache: 'dshm.cache', cwd: 'dshm.cwd', inject: 'dshm.inject', collapsed: 'dshm.collapsed' };
   // The shell is always served *by* the target instance (Android intercepts
   // /__app/** on the configured origin), so location.origin is the server.
   var DEFAULT_SERVER = 'http://36.138.189.24:3080';
@@ -204,10 +204,14 @@
     ws: null,
     settings: null,
     skills: null,
+    modelMenu: null,   // open model popover, so the chip can toggle it
+    permMenu: null,
     authed: false,      // true once a request has succeeded; gates the mux
     loginPass: '',      // survives re-renders of the login form
     drawer: null,
     drawerQuery: '',
+    collapsedCwds: lsJSON(K.collapsed, {}),   // workspace groups the user folded away
+    blankOpen: {},                            // blank-session groups the user expanded
   };
 
   function saveCache() {
@@ -885,37 +889,73 @@
       live.forEach(function (x) { (isPinned(x.sessionId) ? pin : rest).push(x); });
       var rows = pin.concat(rest);
       if (!rows.length) { list.appendChild(el('div', 'empty', S.sessions.length ? '没有匹配的会话' : '正在读取…')); return; }
-      // one block per workspace: the input is already newest-first, so remember the
-      // first-seen order of directories and keep each directory's own ordering.
+
+      // one block per workspace, first-seen order (the input is newest-first)
       var order = [], byCwd = {};
       rows.forEach(function (x) {
         var k = x.cwd || '';
         if (!byCwd[k]) { byCwd[k] = []; order.push(k); }
         byCwd[k].push(x);
       });
-      var grouped = [];
-      order.forEach(function (k) { grouped.push({ cwd: k, items: byCwd[k] }); });
-      var lastCwd = null;
-      grouped.forEach(function (grp) {
-       list.appendChild(el('div', 'dgroup', baseName(grp.cwd) || grp.cwd || '工作区'));
-       grp.items.forEach(function (x) {
-        var cwd = grp.cwd;
-        var r = el('div', 'drow' + (S.cur && S.cur.id === x.sessionId ? ' cur' : ''));
-        r.appendChild(el('div', 'dot ' + (x.running ? 'run' : 'idle')));
-        var t = (x.projections && x.projections.values && x.projections.values.title)
-          || (x.blank ? '（新会话）' : '（无标题）');
-        var tt = el('div', 'dt', (isPinned(x.sessionId) ? '★ ' : '') + t);
-        r.appendChild(tt);
-        r.appendChild(el('div', 'dm', fmtTime(x.updatedAt)));
-        r.addEventListener('click', function () {
-          closeDrawer();
-          if (!S.cur || S.cur.id !== x.sessionId) openSession(x.sessionId, t);
+
+      order.forEach(function (cwd) {
+        var items = byCwd[cwd];
+        var blank = items.filter(function (x) { return x.blank && !isPinned(x.sessionId); });
+        var real = items.filter(function (x) { return !(x.blank && !isPinned(x.sessionId)); });
+
+        var collapsed = !!S.collapsedCwds[cwd];
+        var head = el('div', 'dgroup' + (collapsed ? '' : ' open'));
+        head.appendChild(el('span', 'dchev'));
+        head.appendChild(el('span', 'dglabel', baseName(cwd) || cwd || '工作区'));
+        head.appendChild(el('span', 'dgcount', String(real.length + blank.length)));
+        head.setAttribute('role', 'button');
+        head.addEventListener('click', function () {
+          S.collapsedCwds[cwd] = !collapsed;
+          lsSet(K.collapsed, JSON.stringify(S.collapsedCwds));
+          paint();
         });
-        attachLongPress(r, function () { closeDrawer(); sessionActions(x); });
-        list.appendChild(r);
-       });
+        list.appendChild(head);
+        if (collapsed) return;
+
+        function addRow(x, label) {
+          var r = el('div', 'drow' + (S.cur && S.cur.id === x.sessionId ? ' cur' : ''));
+          r.appendChild(el('div', 'dot ' + (x.running ? 'run' : 'idle')));
+          var t = label || (x.projections && x.projections.values && x.projections.values.title)
+            || (x.blank ? '（空会话）' : '（无标题）');
+          r.appendChild(el('div', 'dt', (isPinned(x.sessionId) ? '★ ' : '') + t));
+          r.appendChild(el('div', 'dm', fmtTime(x.updatedAt)));
+          r.addEventListener('click', function () {
+            closeDrawer();
+            if (!S.cur || S.cur.id !== x.sessionId) openSession(x.sessionId, t);
+          });
+          attachLongPress(r, function () { closeDrawer(); sessionActions(x); });
+          list.appendChild(r);
+        }
+
+        real.forEach(function (x) { addRow(x); });
+
+        // Blank sessions pile up fast (every "new chat" that was never used), so they
+        // collapse into one row instead of flooding the list.
+        if (blank.length) {
+          var openKey = cwd || '';
+          var shown = !!S.blankOpen[openKey];
+          var brow = el('div', 'drow blankrow');
+          brow.appendChild(el('div', 'dot idle'));
+          var bg = el('div', 'grow');
+          bg.appendChild(el('div', 'dt', '空会话 · ' + blank.length + ' 个'));
+          bg.appendChild(el('div', 'dm', shown ? '点一下收起' : '点一下展开'));
+          brow.appendChild(bg);
+          brow.appendChild(el('div', 'dm', shown ? '▾' : '▸'));
+          brow.addEventListener('click', function () {
+            S.blankOpen[openKey] = !shown;
+            paint();
+          });
+          list.appendChild(brow);
+          if (shown) blank.forEach(function (x) { addRow(x); });
+        }
       });
     }
+
     paint();
     q.addEventListener('input', function () {
       S.drawerQuery = q.value;
@@ -1030,27 +1070,28 @@
   }
 
   /** Switch the session's permission preset through the `/permission` command. */
-  function pickPermission() {
-    if (!S.cur) return;
+  function pickPermission(trigger) {
+    if (!S.cur) { toast('先打开一个会话'); return; }
+    if (S.permMenu) { S.permMenu.close(); return; }
     rpc('permissionPresets/catalog', {}).then(function (cat) {
       var current = (S.cur.projections.permissions || {}).currentValue || '';
-      var sheet = el('div', 'toast');
-      sheet.style.top = 'calc(var(--sat) + 50px)';
-      sheet.style.borderRadius = '14px'; sheet.style.padding = '6px';
-      sheet.style.textAlign = 'left'; sheet.style.width = '76vw'; sheet.style.maxWidth = '320px';
-      var html = '<div style="padding:8px 14px;color:var(--fg-faint);font-size:12px">权限预设（当前：' + esc(current || '未知') + '）</div>';
-      (cat.options || []).forEach(function (o) {
-        html += '<div data-v="' + esc(o.value) + '" style="padding:10px 14px;' + (o.value === current ? 'color:var(--accent)' : '') + '">'
-          + esc(o.name || o.value) + (o.value === current ? ' ✓' : '') + '</div>';
+      var menu = chipMenu({
+        top: 'calc(var(--sat) + 50px)',
+        width: '76vw',
+        maxWidth: '320px',
+        trigger: trigger,
+        onClose: function () { S.permMenu = null; }
       });
-      sheet.innerHTML = html;
-      document.body.appendChild(sheet);
-      var close = function () { sheet.remove(); document.removeEventListener('click', outside); };
-      var outside = function () { close(); };
-      sheet.addEventListener('click', function (ev) {
+      S.permMenu = menu;
+      menu.head('权限预设（当前：' + (current || '未知') + '）');
+      (cat.options || []).forEach(function (o) {
+        menu.item(o.name || o.value, { v: o.value }, o.value === current);
+      });
+      menu.cancelRow();
+      menu.node.addEventListener('click', function (ev) {
         var d = ev.target.closest('[data-v]');
         if (!d) return;
-        close();
+        menu.close();
         var preset = d.dataset.v;
         rpc('commands/execute', { agentId: S.cur.id, line: '/permission ' + preset, submittedAttachments: [] })
           .then(function () {
@@ -1060,29 +1101,33 @@
           })
           .catch(function (e) { toast('切换失败：' + e.message); });
       });
-      setTimeout(function () { document.addEventListener('click', outside); }, 0);
     }).catch(function (e) { toast('读取预设失败：' + e.message); });
   }
 
-  function pickModel() {    rpc('session/modelCatalog', {}).then(function (cat) {
-      var sheet = el('div', 'toast');
-      sheet.style.bottom = 'auto'; sheet.style.top = 'calc(var(--sat) + 50px)';
-      sheet.style.borderRadius = '14px'; sheet.style.padding = '6px'; sheet.style.textAlign = 'left';
-      sheet.style.maxHeight = '70vh'; sheet.style.overflowY = 'auto'; sheet.style.width = '76vw';
-      var html = '';
-      html += '<div style="padding:8px 14px;color:var(--fg-faint);font-size:12px">默认：' + esc(cat.default.provider + ' / ' + cat.default.model) + '</div>';
+  function pickModel(trigger) {
+    if (!S.cur) { toast('先打开一个会话'); return; }
+    if (S.modelMenu) { S.modelMenu.close(); return; }   // tapping the chip again closes it
+    rpc('session/modelCatalog', {}).then(function (cat) {
+      var menu = chipMenu({
+        top: 'calc(var(--sat) + 50px)',
+        width: '76vw',
+        maxWidth: '360px',
+        trigger: trigger,
+        onClose: function () { S.modelMenu = null; }
+      });
+      S.modelMenu = menu;
+      menu.head('默认：' + (cat.default ? cat.default.provider + ' / ' + cat.default.model : '未知'));
       (cat.groups || []).forEach(function (g) {
-        html += '<div style="padding:8px 14px;color:var(--fg-faint);font-size:12px">' + esc(g.name || g.id) + '</div>';
+        menu.head(g.name || g.id);
         (g.models || []).forEach(function (m) {
-          html += '<div data-p="' + esc(g.id) + '" data-m="' + esc(m.id) + '" style="padding:9px 14px">' + esc(m.name || m.id) + '</div>';
+          menu.item(m.name || m.id, { p: g.id, m: m.id });
         });
       });
-      sheet.innerHTML = html;
-      document.body.appendChild(sheet);
-      sheet.addEventListener('click', function (ev) {
+      menu.cancelRow();
+      menu.node.addEventListener('click', function (ev) {
         var d = ev.target.closest('[data-p]');
         if (!d) return;
-        sheet.remove();
+        menu.close();
         rpc('session/selectModel', { request: { sessionId: S.cur.id, provider: d.dataset.p, model: d.dataset.m } })
           .then(function () { toast('已切换模型'); })
           .catch(function (e) { toast('切换失败：' + e.message); });
@@ -1475,17 +1520,20 @@
     var next = ms.next || ms.lastUsed;
     if (next) {
       var c = el('span', 'chip', next.model || next.provider);
-      c.addEventListener('click', pickModel);
+      c.dataset.chip = 'model';
+      c.addEventListener('click', function () { pickModel(c); });
       chips.appendChild(c);
     }
     var perms = cur && cur.projections && cur.projections.permissions;
     if (perms && perms.currentValue) {
       var pc = el('span', 'chip', perms.currentValue);
-      pc.addEventListener('click', pickPermission);
+      pc.dataset.chip = 'perm';
+      pc.addEventListener('click', function () { pickPermission(pc); });
       chips.appendChild(pc);
     }
-    if (S.muxReady) chips.appendChild(el('span', 'chip run', '● 已连接'));
-    else chips.appendChild(el('span', 'chip', '连接中…'));
+    var linkChip = el('span', 'chip' + (S.muxReady ? ' run' : ''), S.muxReady ? '● 已连接' : '连接中…');
+    linkChip.dataset.chip = 'link';
+    chips.appendChild(linkChip);
     S.pending.forEach(function (p, i) {
       var c = el('span', 'chip on', '图 ' + (i + 1) + ' ✕');
       c.addEventListener('click', function () { S.pending.splice(i, 1); renderComposer(); });
@@ -1551,10 +1599,15 @@
     box.appendChild(body);
     back.appendChild(box);
     var close = function () {
+      document.removeEventListener('keydown', onKey);
       back.classList.add('out');
       setTimeout(function () { back.remove(); }, 160);
     };
     back.addEventListener('click', function (ev) { if (ev.target === back) close(); });
+    grab.style.cursor = 'pointer';
+    grab.addEventListener('click', function () { close(); });
+    var onKey = function (ev) { if (ev.key === 'Escape' || ev.key === 'Esc') close(); };
+    document.addEventListener('keydown', onKey);
     document.body.appendChild(back);
     requestAnimationFrame(function () { back.classList.add('in'); });
     build(body, close);
@@ -1569,6 +1622,71 @@
     if (opts && opts.active) r.appendChild(el('span', 'sheet-check', '✓'));
     r.addEventListener('click', onClick);
     return r;
+  }
+
+  /**
+   * Floating chip menu. Every dismissal path is wired: tap outside, Escape, or the
+   * 取消 row — a menu that can only be left by making a choice is a trap.
+   */
+  function chipMenu(opts) {
+    opts = opts || {};
+    var node = el('div', 'toast chipmenu');
+    node.style.bottom = 'auto';
+    node.style.top = opts.top || 'calc(var(--sat) + 50px)';
+    node.style.borderRadius = '14px';
+    node.style.padding = '6px';
+    node.style.textAlign = 'left';
+    node.style.width = opts.width || '76vw';
+    if (opts.maxWidth) node.style.maxWidth = opts.maxWidth;
+    node.style.maxHeight = '70vh';
+    node.style.overflowY = 'auto';
+
+    var closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      document.removeEventListener('click', outside, true);
+      document.removeEventListener('keydown', onKey);
+      node.remove();
+      if (opts.onClose) opts.onClose();
+    }
+    function outside(ev) {
+      if (node.contains(ev.target)) return;
+      if (opts.trigger && opts.trigger.contains && opts.trigger.contains(ev.target)) return;
+      close();
+    }
+    function onKey(ev) { if (ev.key === 'Escape' || ev.key === 'Esc') close(); }
+
+    document.body.appendChild(node);
+    // register on the next tick so the tap that opened the menu does not close it
+    setTimeout(function () {
+      if (closed) return;
+      document.addEventListener('click', outside, true);
+      document.addEventListener('keydown', onKey);
+    }, 0);
+
+    return {
+      node: node,
+      close: close,
+      head: function (text) {
+        var h = el('div', 'chipmenu-head', text);
+        node.appendChild(h);
+        return h;
+      },
+      item: function (label, dataset, active) {
+        var d = el('div', 'chipmenu-item' + (active ? ' on' : ''), label);
+        Object.keys(dataset || {}).forEach(function (k) { d.dataset[k] = dataset[k]; });
+        node.appendChild(d);
+        return d;
+      },
+      cancelRow: function () {
+        var c = el('div', 'chipmenu-cancel', '取消');
+        c.setAttribute('role', 'button');
+        c.addEventListener('click', function (ev) { ev.stopPropagation(); close(); });
+        node.appendChild(c);
+        return c;
+      }
+    };
   }
 
   /** Compact token/time summary for the open session. */
