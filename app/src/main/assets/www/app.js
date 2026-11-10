@@ -54,6 +54,31 @@
     if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
     return (n / 1048576).toFixed(1) + ' MB';
   }
+  /** Middle-ellipsis shortener: keeps the head *and* the tail (extension) so a
+   *  long attachment name stays recognisable without ever pushing ✕ off screen.
+   *  Budget is in half-width units at the 12.5px chip font (~6.4px each). */
+  function shortName(name, budget) {
+    var chars = Array.from(String(name == null ? '' : name));
+    var half = function (ch) { return /[\u2e80-\u9fff\uff00-\uffef\u3000-\u303f]/.test(ch) ? 2 : 1; };
+    budget = budget || 46;
+    var total = 0, i;
+    for (i = 0; i < chars.length; i++) total += half(chars[i]);
+    if (total <= budget) return chars.join('');
+    var head = [], tail = [], used = 0;
+    var headBudget = Math.round(budget * 0.55), tailBudget = budget - headBudget - 2;
+    for (i = 0; i < chars.length; i++) {
+      var u = half(chars[i]);
+      if (used + u > headBudget) break;
+      used += u; head.push(chars[i]);
+    }
+    used = 0;
+    for (i = chars.length - 1; i >= 0; i--) {
+      var v = half(chars[i]);
+      if (used + v > tailBudget) break;
+      used += v; tail.unshift(chars[i]);
+    }
+    return head.join('') + '…' + tail.join('');
+  }
   function fmtTime(ts) {
     if (!ts) return '';
     var d = new Date(ts), now = Date.now(), diff = now - ts;
@@ -1395,6 +1420,15 @@
     box.appendChild(ask);
     var chips = el('div', 'chips');
     box.appendChild(chips);
+    // Attachments are content, not metadata: they need a full-width row of their own,
+    // because a chip in the horizontally scrolling metadata row cannot keep both a long
+    // file name and its remove button on screen.
+    var attach = el('div', 'attachbar');
+    attach.hidden = true;
+    box.appendChild(attach);
+    // 待发附件单独一行，不跟状态 chip 抢同一行
+    var atts = el('div', 'atts');
+    box.appendChild(atts);
 
     var line = el('div', 'line');
     var file = document.createElement('input');
@@ -1417,7 +1451,7 @@
     box.appendChild(line);
     box.appendChild(file);
 
-    composerRefs = { ta: ta, send: send, chips: chips, ask: ask, box: box };
+    composerRefs = { ta: ta, send: send, chips: chips, attach: attach, ask: ask, box: box };
 
     ta.addEventListener('input', function () {
       ta.style.height = 'auto';
@@ -1615,19 +1649,7 @@
     var linkChip = el('span', 'chip' + (S.muxReady ? ' run' : ''), S.muxReady ? '● 已连接' : '连接中…');
     linkChip.dataset.chip = 'link';
     chips.appendChild(linkChip);
-    S.pending.forEach(function (p, i) {
-      var label = p.kind === 'file'
-        ? (p.uploading ? '上传中 ' + p.name : p.name)
-        : '图 ' + (i + 1);
-      var c = el('span', 'chip on' + (p.uploading ? ' busy' : ''), label + ' ✕');
-      if (p.kind === 'file') c.title = (p.bytes ? Math.round(p.bytes / 1024) + ' KB · ' : '') + (p.uploading ? '上传中' : '已上传');
-      c.addEventListener('click', function () {
-        if (p.uploading && p.kind === 'file') { toast('还在上传，稍等一下'); return; }
-        S.pending.splice(i, 1);
-        renderComposer();
-      });
-      chips.appendChild(c);
-    });
+    renderAttachments();
     var ta = composerRefs.ta;
     var send = composerRefs.send;
     if (cur && cur.running) {
@@ -1776,6 +1798,72 @@
         return c;
       }
     };
+  }
+
+  /** Keep both ends of a long name so the extension stays readable. */
+  function midEllipsis(name, keep) {
+    var n = String(name || '');
+    keep = keep || 30;
+    if (n.length <= keep) return n;
+    var head = Math.ceil((keep - 1) / 2);
+    var tail = Math.floor((keep - 1) / 2);
+    return n.slice(0, head) + '…' + n.slice(n.length - tail);
+  }
+
+  function fmtBytes(b) {
+    if (!b && b !== 0) return '';
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(b < 10240 ? 1 : 0) + ' KB';
+    return (b / 1024 / 1024).toFixed(1) + ' MB';
+  }
+
+  /**
+   * One full-width row per attachment. The remove button is pinned right and never
+   * shrinks, so a long name can only ever be truncated — it can never push the ✕ out.
+   */
+  function renderAttachments() {
+    var bar = composerRefs.attach;
+    if (!bar) return;
+    bar.innerHTML = '';
+    bar.hidden = !S.pending.length;
+    S.pending.forEach(function (p, i) {
+      var row = el('div', 'attachitem' + (p.uploading ? ' busy' : ''));
+
+      var ic = el('div', 'attachicon');
+      if (p.kind === 'image' && p.data) {
+        var img = document.createElement('img');
+        img.src = 'data:' + p.mediaType + ';base64,' + p.data;
+        img.alt = '';
+        ic.appendChild(img);
+      } else {
+        ic.textContent = p.kind === 'file' ? '📄' : '🖼';
+      }
+      row.appendChild(ic);
+
+      var main = el('div', 'attachmain');
+      var nm = el('div', 'attachname', midEllipsis(p.name || (p.kind === 'image' ? '图片 ' + (i + 1) : '文件')));
+      nm.title = p.name || '';
+      main.appendChild(nm);
+      var bits = [];
+      if (p.kind === 'image') bits.push('图片');
+      if (p.bytes) bits.push(fmtBytes(p.bytes));
+      bits.push(p.uploading ? '上传中…' : '已上传');
+      main.appendChild(el('div', 'attachmeta', bits.join(' · ')));
+      row.appendChild(main);
+
+      var x = el('button', 'attachx', '✕');
+      x.type = 'button';
+      x.setAttribute('aria-label', '移除 ' + (p.name || '附件'));
+      x.addEventListener('click', function (ev) {
+        ev.stopPropagation();
+        if (p.uploading && p.kind === 'file') { toast('还在上传，稍等一下'); return; }
+        S.pending.splice(i, 1);
+        renderComposer();
+      });
+      row.appendChild(x);
+
+      bar.appendChild(row);
+    });
   }
 
   /** Compact token/time summary for the open session. */
