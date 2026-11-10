@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.10.0 | **附件上传补全**：壳层实现 `onShowFileChooser`（原来点"+"在手机上毫无反应）+ 任意文件走 `POST /api/session/uploadFileBinary` 拿 `receiptId` 挂进 prompt；图片仍走内联 base64 |
 | 1.9.3 | 抽屉改为**按工作区归属分组**（与桌面端一致），不属于任何工作区的会话归到「未分组」并在行尾标出所在目录名；顺手清掉测试遗留在 `scratch` 的 7 个空会话 |
 | 1.9.2 | **模型/权限浮层可以退出了**（原来只能选一个才能关）；**工作区目录可折叠**（记住折叠状态）；**空会话折叠成一行**不再刷屏；composer chip 加 `data-chip` 标识 |
 | 1.9.1 | **修登录页反复刷新**（未登录时 WebSocket 403 重连 → 整个界面重绘 → 密码框被清空，根本没法输入）；顺带修设置面板测试自身的时序竞态 |
@@ -201,6 +202,35 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 **验证**：`test/harness-login.mjs`（未带 cookie 的全新上下文）—— 修前 6 秒内 **6 次重建**、输入被清空、
 控制台刷 5 条 `remote.mux 403`；修后 **0 次重建**、输入保留且保持焦点、登录后正常进列表、控制台干净。
 
+### 附件上传：手机端到底能不能用（2026-11-10 查证并补全）
+
+**查证结论（改前）**：网页层其实一直有图片附件（`+ → input[type=file] → base64 → session/prompt`），
+但**壳层是裸的 `new WebChromeClient()`，没有实现 `onShowFileChooser`** —— Android WebView 对
+`<input type="file">` 的点击会**静默丢弃**，所以手机上点"+"毫无反应，等于没做。另外 `accept` 只有
+`image/*`，普通文件（pdf/txt/zip…）完全没有入口。
+
+**0.2.2 的协议（照 `dsh-api-session-controller/types/types.d.ts` 的 `PromptContentPart`）**：
+
+```
+| { type: 'text';  text: string }
+| { type: 'image'; mediaType: ImageMediaType; data: string; name?: string }
+| { type: 'file';  receiptId: Branded<'file-upload-receipt-id'> }
+```
+
+- 图片：**内联 base64 仍然被接受**（实测 ACCEPTED），不需要先上传。
+- 文件：必须先 `POST /api/session/uploadFileBinary?sessionId=…&name=…`（`content-type: application/octet-stream`，
+  body 是原始字节，**不带 mediaType 就是普通文件**），拿到 `{receiptId, file:{attachmentId,name,bytes}}`，
+  再把 `{type:'file', receiptId}` 放进 prompt。实测 `session/prompt` **ACCEPTED**。
+  带 `mediaType` 时该路由会把 body 当图片并做校验（坏图返回 `session/attachment-invalid / INVALID_IMAGE`）。
+- **receipt 是会话级的**：换会话必须清空待发附件，否则会带着上一个会话的 receipt 发出去。
+
+**实现**：壳层 `onShowFileChooser` + `onActivityResult`（必须回填 `ValueCallback`，否则输入框永久卡住）；
+网页层 `accept="*/*"`，图片走内联、其它文件走上传拿 receipt，chip 显示文件名与"上传中"转圈，
+上传未完成时拒绝发送并提示；`openSession` 切换会话清空 pending。
+
+**验证**：`test/harness-upload.mjs` 9 项（一次性会话，真实上传、断言 prompt 组装形状、不真发消息）；
+`tools/probe-upload-send.mjs` 做了一次真实投递，`session/prompt` 接受 file part。
+
 ### 抽屉分组依据：工作区归属，不是 `cwd`（2026-11-10 修正）
 
 用户问「scratch 不是我的工作目录吧，是未分组的意思吗」——查证结果：
@@ -306,6 +336,7 @@ test/harness-sched22.mjs   定时任务 0.2.2：列表/表单新建/暂停/恢�
 test/harness-ui.mjs        桌面化 UI：抽屉/切换/搜索/去气泡/回到底部/代码复制/返回键，12 项断言
 test/harness-login.mjs     登录页稳定性：不重建/不丢输入/能登录，5 项断言
 test/harness-menus.mjs     模型/权限浮层可退出 + 抽屉折叠 + 空会话折叠，15 项断言（含"不得改动人类会话"守卫）
+test/harness-upload.mjs    附件：任意类型选择、文件上传拿 receipt、图片内联、prompt 组装、换会话清空，9 项断言
 tools/model-state.mjs      打印某会话的当前模型与 model/selection 条数，用于前后对照
 tools/restore-model.mjs    把会话模型显式恢复为 provider/model
 tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）

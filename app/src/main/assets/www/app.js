@@ -481,6 +481,8 @@
   }
 
   function openSession(id, title) {
+    if (S.cur && S.cur.id !== id) S.pending = [];   // upload receipts belong to one session
+
     if (S.cur && S.cur.followId) { S.mux && S.mux.closeStream(S.cur.followId); }
     S.cur = { id: id, title: title || '会话', records: [], live: null, header: null, hasMore: false, throughSeq: 0, running: false, projections: {}, followId: null, loaded: false };
     S.view = 'chat';
@@ -577,11 +579,20 @@
     }
   }
 
-  function sendPrompt(text, images) {
-    if (!S.cur) return Promise.resolve();
+  /** session/prompt content: text, inline images, and uploaded files by receipt. */
+  function buildPromptParts(text, pending) {
     var content = [];
     if (text) content.push({ type: 'text', text: text });
-    (images || []).forEach(function (im) { content.push({ type: 'image', mediaType: im.mediaType, data: im.data, name: im.name }); });
+    (pending || []).forEach(function (p) {
+      if (p.kind === 'file') { if (p.receiptId) content.push({ type: 'file', receiptId: p.receiptId }); }
+      else content.push({ type: 'image', mediaType: p.mediaType, data: p.data, name: p.name });
+    });
+    return content;
+  }
+
+  function sendPrompt(text, pending) {
+    if (!S.cur) return Promise.resolve();
+    var content = buildPromptParts(text, pending);
     if (!content.length) return Promise.resolve();
     return rpc('session/prompt', {
       request: { requestId: uuid(), sessionId: S.cur.id, mode: 'queue', content: content, clientTimeZone: tz() }
@@ -1387,8 +1398,9 @@
 
     var line = el('div', 'line');
     var file = document.createElement('input');
-    file.type = 'file'; file.accept = 'image/*'; file.multiple = true; file.style.display = 'none';
-    file.addEventListener('change', function () { addImages(file.files); file.value = ''; });
+    file.type = 'file'; file.accept = '*/*'; file.multiple = true; file.style.display = 'none';
+    file.dataset.role = 'attach';
+    file.addEventListener('change', function () { addFiles(file.files); file.value = ''; });
 
     var ta = document.createElement('textarea');
     ta.rows = 1;
@@ -1507,6 +1519,7 @@
     if (!ta) return;
     var text = ta.value.trim();
     if (!text && !S.pending.length) return;
+    if (S.pending.some(function (p) { return p.uploading; })) { toast('文件还在上传，稍等一下'); return; }
     ta.value = ''; ta.style.height = 'auto';
     var images = S.pending.slice();
     S.pending = [];
@@ -1519,18 +1532,62 @@
     });
   }
 
-  function addImages(files) {
+  /** A file part needs a receipt staged on this very session (0.2.2 prompt schema). */
+  function uploadFileAsReceipt(file) {
+    if (!S.cur) return Promise.reject(new ApiError('先打开一个会话', 'no-session'));
+    var name = file.name || ('file-' + Date.now());
+    var q = 'sessionId=' + encodeURIComponent(S.cur.id) + '&name=' + encodeURIComponent(name);
+    return fetch(S.server + '/api/session/uploadFileBinary?' + q, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: file
+    }).then(function (res) {
+      return res.text().then(function (t) {
+        var json = null;
+        try { json = JSON.parse(t); } catch (e) {}
+        if (!res.ok || !json || json.ok === false) {
+          var err = (json && json.error) || {};
+          throw new ApiError('上传失败：' + (err.message || ('HTTP ' + res.status)), err.code || 'upload');
+        }
+        return json.value || {};
+      });
+    });
+  }
+
+  function addFiles(files) {
     Array.prototype.slice.call(files || []).forEach(function (f) {
-      if (f.size > 6 * 1024 * 1024) { toast('图片过大（>6MB）'); return; }
-      var fr = new FileReader();
-      fr.onload = function () {
-        var s = String(fr.result);
-        var m = /^data:([^;]+);base64,(.*)$/.exec(s);
-        if (!m) return;
-        S.pending.push({ mediaType: m[1], data: m[2], name: f.name });
+      var isImage = /^image\//.test(f.type || '');
+      if (isImage) {
+        // prompt images still travel inline as base64 (session/prompt accepts them)
+        if (f.size > 6 * 1024 * 1024) { toast('图片过大（>6MB）'); return; }
+        var fr = new FileReader();
+        fr.onload = function () {
+          var s = String(fr.result);
+          var m = /^data:([^;]+);base64,(.*)$/.exec(s);
+          if (!m) return;
+          S.pending.push({ kind: 'image', mediaType: m[1], data: m[2], name: f.name });
+          renderComposer();
+        };
+        fr.readAsDataURL(f);
+        return;
+      }
+      if (f.size > 100 * 1024 * 1024) { toast('文件过大（>100MB）'); return; }
+      var ph = { kind: 'file', name: f.name || '文件', bytes: f.size, uploading: true };
+      S.pending.push(ph);
+      renderComposer();
+      uploadFileAsReceipt(f).then(function (value) {
+        if (!value.receiptId) throw new ApiError('上传没有返回 receiptId', 'upload');
+        ph.receiptId = value.receiptId;
+        if (value.file && value.file.attachmentId) ph.attachmentId = value.file.attachmentId;
+        ph.uploading = false;
         renderComposer();
-      };
-      fr.readAsDataURL(f);
+      }).catch(function (e) {
+        S.pending = S.pending.filter(function (x) { return x !== ph; });
+        renderComposer();
+        toast(e.message || '上传失败');
+        if (e.code === 'unauthenticated') showLogin();
+      });
     });
   }
 
@@ -1559,8 +1616,16 @@
     linkChip.dataset.chip = 'link';
     chips.appendChild(linkChip);
     S.pending.forEach(function (p, i) {
-      var c = el('span', 'chip on', '图 ' + (i + 1) + ' ✕');
-      c.addEventListener('click', function () { S.pending.splice(i, 1); renderComposer(); });
+      var label = p.kind === 'file'
+        ? (p.uploading ? '上传中 ' + p.name : p.name)
+        : '图 ' + (i + 1);
+      var c = el('span', 'chip on' + (p.uploading ? ' busy' : ''), label + ' ✕');
+      if (p.kind === 'file') c.title = (p.bytes ? Math.round(p.bytes / 1024) + ' KB · ' : '') + (p.uploading ? '上传中' : '已上传');
+      c.addEventListener('click', function () {
+        if (p.uploading && p.kind === 'file') { toast('还在上传，稍等一下'); return; }
+        S.pending.splice(i, 1);
+        renderComposer();
+      });
       chips.appendChild(c);
     });
     var ta = composerRefs.ta;
@@ -3754,6 +3819,9 @@
 
   window.__DSHM__ = {
     state: S, rpc: rpc, md: md, login: login, back: goBack,
+    pendingParts: function (text) { return buildPromptParts(text || '', S.pending); },
+    addFiles: function (files) { addFiles(files); },
+    pending: function () { return S.pending.slice(); },
     chatRefs: chatRefs, renderChat: renderChat, setRendered: function (n) { renderedCount = n; },
     // test hooks (used by test/harness*.mjs)
     open: function (id, title) { openSession(id, title); },

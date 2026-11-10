@@ -17,6 +17,7 @@ import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
+import android.webkit.ValueCallback;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -46,6 +47,8 @@ public class MainActivity extends Activity {
     private static final String PREFS = "dshm";
 
     private WebView web;
+    private static final int REQ_FILE_CHOOSER = 4017;
+    private ValueCallback<Uri[]> filePathCallback;
     private SharedPreferences prefs;
 
     private static final Map<String, String> MIME = new HashMap<String, String>();
@@ -61,6 +64,7 @@ public class MainActivity extends Activity {
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
+
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
@@ -94,7 +98,40 @@ public class MainActivity extends Activity {
         cm.setAcceptThirdPartyCookies(web, true);
 
         web.setWebViewClient(new ShellClient());
-        web.setWebChromeClient(new WebChromeClient());
+        web.setWebChromeClient(new WebChromeClient() {
+            /**
+             * Android ignores <input type="file"> unless this is implemented; the page
+             * then looks like it has no upload button at all. params.createIntent()
+             * already carries the page's accept types and the multiple flag.
+             */
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
+                }
+                filePathCallback = callback;
+                Intent intent = null;
+                try {
+                    intent = params.createIntent();
+                } catch (Exception ignored) {
+                }
+                if (intent == null) {
+                    intent = new Intent(Intent.ACTION_GET_CONTENT);
+                    intent.setType("*/*");
+                }
+                try {
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                } catch (Exception ignored) {
+                }
+                try {
+                    startActivityForResult(Intent.createChooser(intent, "选择文件"), REQ_FILE_CHOOSER);
+                } catch (Exception e) {
+                    filePathCallback = null;
+                    return false;
+                }
+                return true;
+            }
+        });
         web.addJavascriptInterface(new Bridge(), "DSHMAndroid");
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             WebView.setWebContentsDebuggingEnabled(true);
@@ -102,6 +139,31 @@ public class MainActivity extends Activity {
 
         setContentView(web);
         web.loadUrl(server() + PREFIX + "index.html");
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQ_FILE_CHOOSER) {
+            if (filePathCallback != null) {
+                Uri[] result = null;
+                if (resultCode == Activity.RESULT_OK && data != null) {
+                    ClipData clip = data.getClipData();
+                    if (clip != null) {
+                        int n = clip.getItemCount();
+                        result = new Uri[n];
+                        for (int i = 0; i < n; i++) {
+                            result[i] = clip.getItemAt(i).getUri();
+                        }
+                    } else if (data.getData() != null) {
+                        result = new Uri[] { data.getData() };
+                    }
+                }
+                filePathCallback.onReceiveValue(result);
+                filePathCallback = null;
+            }
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
     }
 
     private String server() {
