@@ -890,40 +890,64 @@
       var rows = pin.concat(rest);
       if (!rows.length) { list.appendChild(el('div', 'empty', S.sessions.length ? '没有匹配的会话' : '正在读取…')); return; }
 
-      // one block per workspace, first-seen order (the input is newest-first)
-      var order = [], byCwd = {};
-      rows.forEach(function (x) {
-        var k = x.cwd || '';
-        if (!byCwd[k]) { byCwd[k] = []; order.push(k); }
-        byCwd[k].push(x);
-      });
+      // membership first (desktop semantics); fall back to cwd grouping before the
+      // workspace stream has delivered its baseline
+      var wsList = (S.ws && S.ws.ready && S.ws.items) ? S.ws.items : null;
+      var ownerOf = {};
+      if (wsList) {
+        wsList.forEach(function (w) {
+          (w.sessionIds || []).forEach(function (sid) { ownerOf[sid] = w.workspaceId; });
+        });
+      }
+      var groups = [];
+      if (wsList) {
+        wsList.forEach(function (w) { groups.push({ key: w.workspaceId, label: w.title || baseName(w.path), path: w.path, items: [] }); });
+        var ungrouped = { key: '__ungrouped', label: '未分组', path: '', items: [] };
+        rows.forEach(function (x) {
+          var wid = ownerOf[x.sessionId];
+          var g = null;
+          for (var i = 0; i < groups.length; i++) if (groups[i].key === wid) { g = groups[i]; break; }
+          (g || ungrouped).items.push(x);
+        });
+        groups = groups.filter(function (g) { return g.items.length; });
+        if (ungrouped.items.length) groups.push(ungrouped);
+      } else {
+        var order = [], byCwd = {};
+        rows.forEach(function (x) {
+          var k = x.cwd || '';
+          if (!byCwd[k]) { byCwd[k] = []; order.push(k); }
+          byCwd[k].push(x);
+        });
+        order.forEach(function (k) { groups.push({ key: k || '__none', label: baseName(k) || k || '未分组', path: k, items: byCwd[k] }); });
+      }
 
-      order.forEach(function (cwd) {
-        var items = byCwd[cwd];
-        var blank = items.filter(function (x) { return x.blank && !isPinned(x.sessionId); });
-        var real = items.filter(function (x) { return !(x.blank && !isPinned(x.sessionId)); });
+      groups.forEach(function (grp) {
+        var blank = grp.items.filter(function (x) { return x.blank && !isPinned(x.sessionId); });
+        var real = grp.items.filter(function (x) { return !(x.blank && !isPinned(x.sessionId)); });
+        var collapsed = !!S.collapsedCwds[grp.key];
 
-        var collapsed = !!S.collapsedCwds[cwd];
         var head = el('div', 'dgroup' + (collapsed ? '' : ' open'));
         head.appendChild(el('span', 'dchev'));
-        head.appendChild(el('span', 'dglabel', baseName(cwd) || cwd || '工作区'));
-        head.appendChild(el('span', 'dgcount', String(real.length + blank.length)));
+        head.appendChild(el('span', 'dglabel', grp.label));
+        head.appendChild(el('span', 'dgcount', String(grp.items.length)));
         head.setAttribute('role', 'button');
         head.addEventListener('click', function () {
-          S.collapsedCwds[cwd] = !collapsed;
+          S.collapsedCwds[grp.key] = !collapsed;
           lsSet(K.collapsed, JSON.stringify(S.collapsedCwds));
           paint();
         });
         list.appendChild(head);
         if (collapsed) return;
 
-        function addRow(x, label) {
+        function addRow(x, showFolder) {
           var r = el('div', 'drow' + (S.cur && S.cur.id === x.sessionId ? ' cur' : ''));
           r.appendChild(el('div', 'dot ' + (x.running ? 'run' : 'idle')));
-          var t = label || (x.projections && x.projections.values && x.projections.values.title)
-            || (x.blank ? '（空会话）' : '（无标题）');
+          var t = (x.projections && x.projections.values && x.projections.values.title)
+            || (x.blank ? '空会话' : '（无标题）');
           r.appendChild(el('div', 'dt', (isPinned(x.sessionId) ? '★ ' : '') + t));
-          r.appendChild(el('div', 'dm', fmtTime(x.updatedAt)));
+          var meta = el('div', 'dm', fmtTime(x.updatedAt));
+          if (showFolder && x.cwd) meta.textContent = baseName(x.cwd) + ' · ' + fmtTime(x.updatedAt);
+          r.appendChild(meta);
           r.addEventListener('click', function () {
             closeDrawer();
             if (!S.cur || S.cur.id !== x.sessionId) openSession(x.sessionId, t);
@@ -932,13 +956,13 @@
           list.appendChild(r);
         }
 
-        real.forEach(function (x) { addRow(x); });
+        var ungrouped = grp.key === '__ungrouped';
+        real.forEach(function (x) { addRow(x, ungrouped); });
 
         // Blank sessions pile up fast (every "new chat" that was never used), so they
         // collapse into one row instead of flooding the list.
         if (blank.length) {
-          var openKey = cwd || '';
-          var shown = !!S.blankOpen[openKey];
+          var shown = !!S.blankOpen[grp.key];
           var brow = el('div', 'drow blankrow');
           brow.appendChild(el('div', 'dot idle'));
           var bg = el('div', 'grow');
@@ -947,11 +971,11 @@
           brow.appendChild(bg);
           brow.appendChild(el('div', 'dm', shown ? '▾' : '▸'));
           brow.addEventListener('click', function () {
-            S.blankOpen[openKey] = !shown;
+            S.blankOpen[grp.key] = !shown;
             paint();
           });
           list.appendChild(brow);
-          if (shown) blank.forEach(function (x) { addRow(x); });
+          if (shown) blank.forEach(function (x) { addRow(x, ungrouped); });
         }
       });
     }
