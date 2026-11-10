@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.9.1 | **修登录页反复刷新**（未登录时 WebSocket 403 重连 → 整个界面重绘 → 密码框被清空，根本没法输入）；顺带修设置面板测试自身的时序竞态 |
 | 1.9.0 | **适配 dsh 0.2.2-rc.1**（终端上行流、定时任务新 API + 新建/立即执行/暂停恢复）+ **桌面化 UI**（抽屉侧栏、助手正文去气泡、回到最新浮标、代码块复制）+ 修掉 http 下复制失效的真 bug |
 | 1.8.1 | **滚动三修**：打开会话直接落到最新消息（之前停在最上面）；「载入更早的消息」按高度差补偿，阅读位置不再被打飞；回合结束重绘不再跳回顶部。断言在 `test/scroll-local.mjs` 与 `test/jump-local.mjs` |
 | 1.8.0 | **设置可写**：凭据（9 个 API Key，改/清）、20 个配置项的标量字段编辑（带 revision CAS，过期即拒）、203 个插件清单 + 启停；**技能面板**（`skills/list`，9 个技能，可复制名称/SKILL.md 路径） |
@@ -178,6 +179,26 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 
 **环境变化**：3080 现在只绑 `172.16.0.59`（公网 `36.138.189.24:3080` 仍可达，靠端口转发），新增 `8443` TLS 只绑内网、公网连不上；升级后登录 cookie 全部失效，测试台状态要用 `tools/refresh-state.mjs` 重新抓。
 
+### 登录页「反复刷新、打不进密码」（2026-11-10 修复）
+
+**现象**：手机端未登录时登录界面不停刷新，密码框里打的字会被清掉。
+
+**根因（不是登录逻辑，是实时通道的重连风暴）**：`run()` 在看是否登录之前就 `mux()` + `attachForwardedEvents()`，
+未登录时 `/api/remote.mux` 握手返回 **403** → `ws.onclose` → `scheduleRetry()` **并且 `render()`**；
+`render()` 在 `S.view === 'login'` 时走 `renderLogin()`，那里 `mount()` 会 `app.innerHTML = ''` 整棵树重建
+→ 输入框被销毁（焦点丢失、已输入内容丢失）。退避是 500·1.7^n，前几秒约每秒一次，所以看起来像页面在刷新。
+
+**修法**（四处，都在 `app.js`）：
+
+1. 新增 `S.authed`；`Mux.connect` / `scheduleRetry` 在未认证时**直接不连**。
+2. `ws.onopen` / `ws.onclose` 里的 `render()` 在 `login`/`setup` 视图下**跳过**。
+3. `run()` 改成先 `loadSessions()`，成功后才开 mux；`loadSessions` 成功即置 `S.authed = true`。
+4. `showLogin()` 把 mux 彻底关掉（`closed = true` + `ws.close()` + 置 null），不留重连在后台跑。
+   另外密码框的值存进 `S.loginPass` 并在重绘后回填 + 自动聚焦。
+
+**验证**：`test/harness-login.mjs`（未带 cookie 的全新上下文）—— 修前 6 秒内 **6 次重建**、输入被清空、
+控制台刷 5 条 `remote.mux 403`；修后 **0 次重建**、输入保留且保持焦点、登录后正常进列表、控制台干净。
+
 ### 踩过的坑（都值得保留）
 
 1. **明文 HTTP 下没有 `crypto.randomUUID`**（secure context 限制），需自备 polyfill；`crypto.getRandomValues` 可用。
@@ -240,6 +261,7 @@ test/harness-settings.mjs  设置可写 + 插件 + 技能：12 项断言（含�
 test/probe-022.mjs         0.2.2 协议探针（terminal/attach 双向 + schedule 新结构）
 test/harness-sched22.mjs   定时任务 0.2.2：列表/表单新建/暂停/恢复/删除，9 项断言
 test/harness-ui.mjs        桌面化 UI：抽屉/切换/搜索/去气泡/回到底部/代码复制/返回键，12 项断言
+test/harness-login.mjs     登录页稳定性：不重建/不丢输入/能登录，5 项断言
 tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）
 test/measure.mjs      冷/热启动首帧耗时
 ```

@@ -204,6 +204,8 @@
     ws: null,
     settings: null,
     skills: null,
+    authed: false,      // true once a request has succeeded; gates the mux
+    loginPass: '',      // survives re-renders of the login form
     drawer: null,
     drawerQuery: '',
   };
@@ -277,13 +279,15 @@
   Mux.prototype.url = function () { return S.server.replace(/^http/, 'ws') + '/api/remote.mux'; };
   Mux.prototype.connect = function () {
     var self = this;
-    if (this.closed) return;
+    // Before login the handshake is rejected (403), and every rejection used to
+    // re-render the shell — that is what made the login form unusable.
+    if (this.closed || !S.authed) return;
     try { this.ws = new WebSocket(this.url()); } catch (e) { return this.scheduleRetry(); }
     this.ws.onopen = function () {
       self.retry = 0;
       S.muxReady = true;
       self.streams.forEach(function (st) { self.send({ type: 'open', streamId: st.id, endpoint: st.endpoint, payload: { args: st.args } }); });
-      render();
+      if (S.view !== 'login' && S.view !== 'setup') render();
     };
     this.ws.onmessage = function (ev) {
       var m; try { m = JSON.parse(ev.data); } catch (e) { return; }
@@ -295,15 +299,15 @@
     };
     this.ws.onclose = function () {
       S.muxReady = false;
-      if (!self.closed) self.scheduleRetry();
-      render();
+      if (!self.closed && S.authed) self.scheduleRetry();
+      if (S.view !== 'login' && S.view !== 'setup') render();
     };
     this.ws.onerror = function () {};
   };
   Mux.prototype.scheduleRetry = function () {
     var self = this;
     this.retry = Math.min(this.retry + 1, 6);
-    setTimeout(function () { self.connect(); }, 500 * Math.pow(1.7, this.retry));
+    setTimeout(function () { if (S.authed) self.connect(); }, 500 * Math.pow(1.7, this.retry));
   };
   Mux.prototype.send = function (obj) {
     if (this.ws && this.ws.readyState === 1) { this.ws.send(JSON.stringify(obj)); return true; }
@@ -326,7 +330,8 @@
   Mux.prototype.closeAll = function () { this.streams.clear(); };
 
   function mux() {
-    if (!S.mux) { S.mux = new Mux(); S.mux.connect(); }
+    if (!S.mux) S.mux = new Mux();
+    if (S.authed && !S.mux.ws && !S.mux.closed) S.mux.connect();
     return S.mux;
   }
 
@@ -462,6 +467,7 @@
   function loadSessions() {
     return rpc('session/list', { _request: {} }).then(function (v) {
       S.sessions = (v && v.items) || [];
+      S.authed = true;
       S.sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
       try { wsEnsure(); } catch (e) {}
       saveCache();
@@ -3491,14 +3497,20 @@
     var inner = el('div', 'pane');
     inner.innerHTML = '<div class="hint">访问密码已失效或未登录，重新输入密码即可。</div>';
     var pass = document.createElement('input');
-    pass.type = 'password'; pass.value = S.pass || ''; pass.placeholder = '访问密码';
+    pass.type = 'password';
+    pass.value = S.loginPass || S.pass || '';
+    pass.placeholder = '访问密码';
+    pass.addEventListener('input', function () { S.loginPass = pass.value; });
+    pass.addEventListener('focus', function () { try { pass.select(); } catch (e) {} });
     inner.appendChild(pass);
     var err = el('div', 'err-box'); err.hidden = true; inner.appendChild(err);
     var go = el('button', 'btn', '登录'); go.style.width = '100%';
+    setTimeout(function () { try { if (!pass.value) pass.focus(); } catch (e) {} }, 60);
     go.addEventListener('click', function () {
-      S.pass = pass.value; lsSet(K.pass, S.pass);
+      S.pass = pass.value; S.loginPass = pass.value; lsSet(K.pass, S.pass);
       go.disabled = true; go.textContent = '登录中…';
       login(S.server, S.pass).then(function () {
+        S.authed = true;
         S.view = 'sessions'; resetMux();
         loadSessions(); render();
       }).catch(function (e) { go.disabled = false; go.textContent = '登录'; err.hidden = false; err.textContent = e.message; });
@@ -3515,7 +3527,12 @@
 
   function showLogin() {
     if (S.view === 'login' || S.view === 'setup') return;
+    S.authed = false;
     if (S.cur && S.cur.followId && S.mux) S.mux.closeStream(S.cur.followId);
+    if (S.mux) { S.mux.closed = true; try { S.mux.ws && S.mux.ws.close(); } catch (e) {} S.mux = null; }
+    S.muxReady = false;
+    S.forwardId = null;
+    S.clientId = '';
     S.cur = null; S.view = 'login'; render();
   }
 
@@ -3574,9 +3591,12 @@
     // Paint the cached list immediately, then refresh.
     S.view = 'sessions';
     render();
-    mux();
-    attachForwardedEvents();
-    loadSessions().catch(function (e) {
+    loadSessions().then(function () {
+      // Authenticated: now it is safe to open the live streams.
+      mux();
+      attachForwardedEvents();
+      render();
+    }).catch(function (e) {
       if (e.code === 'unauthenticated') showLogin();
       else { S.lastError = '连不上服务器：' + e.message; render(); }
     });
