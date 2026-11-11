@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.developerye.dshm"
         minSdk = 26
         targetSdk = 34
-        versionCode = 17
-        versionName = "1.11.0"
+        versionCode = 18
+        versionName = "1.11.1"
     }
 
     signingConfigs {

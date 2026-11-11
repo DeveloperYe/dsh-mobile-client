@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.11.1 | **修「每推进一步就刷新聊天框、打不进字」**：follow 流每来一条 `assistant/message` 都会调 `loadSessions()`，而它结尾 `render()` 重建整页（textarea 被销毁、焦点丢失）；现在列表刷新不再重绘当前视图，另加草稿保留兜底 |
 | 1.11.0 | **发出的图片能看了**（原来渲染成 `［图片］` 文本）：按 `attachmentId` 走 `session/attachment` 取回并内联显示，点开可全屏；**忙时排队**有了可见反馈：队列条显示待发条数、内容、可逐条移除 |
 | 1.10.1 | **附件移到独立一行**（不再挤在横向滚动的 chip 行里）；长文件名中段省略并保留扩展名，删除按钮固定右侧、永远可点；图片显示缩略图 |
 | 1.10.0 | **附件上传补全**：壳层实现 `onShowFileChooser`（原来点"+"在手机上毫无反应）+ 任意文件走 `POST /api/session/uploadFileBinary` 拿 `receiptId` 挂进 prompt；图片仍走内联 base64 |
@@ -204,6 +205,56 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 **验证**：`test/harness-login.mjs`（未带 cookie 的全新上下文）—— 修前 6 秒内 **6 次重建**、输入被清空、
 控制台刷 5 条 `remote.mux 403`；修后 **0 次重建**、输入保留且保持焦点、登录后正常进列表、控制台干净。
 
+### 每推进一步就刷新、打不进字（2026-11-11 修复）
+
+**现象**：助手每推进一步（每条消息/工具调用），聊天区就重建一次，输入框里打的字被清空、键盘焦点丢失。
+
+**根因**（一步到位的因果链，不是猜的）：
+
+```
+onFollowFrame(event)
+  └─ if (ev.type === 'assistant/message' || 'turn/end') loadSessions()
+       └─ loadSessions() … render()          ← 结尾无条件重绘
+            └─ render() → renderChatView()   ← S.view === 'chat' 时整页重建
+                 └─ composer() → 新建 <textarea>   ← 旧节点连同已输入内容一起销毁
+```
+
+也就是说：**列表数据更新顺手把整个会话页重画了**。手机上一轮里会有很多步，于是表现为"一直在刷新、根本没法输入"。
+
+**修法**：
+
+1. `loadSessions(opts)` 支持 `{repaint:false}`；follow 流里只更新列表数据、不重绘当前视图。
+   其他调用点（会话列表页的 30s 轮询、切回前台）保持重绘，行为不变。
+2. 兜底：新增 `S.draft`，输入即记录、`composer()` 建新 textarea 时回填、发送成功才清空。
+   这样即使将来因为主题切换等原因真的整页重建，草稿也不会丢。
+
+**A/B 证据**（`tools/probe-typing-ab.mjs`，一次性会话，纯客户端断言）：
+
+| 路径 | textarea 是否同一个节点 | 焦点是否还在 | 内容 |
+|---|---|---|---|
+| 旧行为 `loadSessions()`（重绘） | **false**（被替换） | **false** | 值还在但焦点已丢 |
+| 修复后 `loadSessions({repaint:false})` | **true** | **true** | 保持 |
+| 强制整页重建 `renderView()` | 新节点 | — | 草稿回填成功 |
+
+另有 `test/harness-typing.mjs` 做真实场景：在**真跑动**的一轮里逐字输入 10 个字，10/10 次采样时 `running=true`，
+最终 `typed="这是跑着的时候打的字"`、焦点保持 —— 5/5 通过。
+
+### ⚠️ 事故：探针误伤了真实会话（2026-11-11）
+
+写上面那个 A/B 探针时，为了"挑一个能用的会话"，它按**回合数最多**去选 —— 选中的正是用户真实在跑的会话，
+而且脚本末尾带了一句 `session/cancel`。结果上一次工具调用被中断时，用户的实时回合 `turn/end` 记录为
+`aborted`（seq 5156）。核对结果：**模型没有被切**（仍 `wb2api / cn:deepseek-v4.1-flash`）、
+**没有塞进任何多余 prompt**（日志里只有用户自己的消息），但"打断当前回合"这件事本身已经发生。
+
+**新增硬规则（比"测试不要碰真实会话"更严）**：
+
+1. 任何会写状态的探针/测试（`session/prompt`、`session/cancel`、`session/updateQueue`、`session/selectModel`…）
+   **必须自己 `session/create` 一个一次性会话**，用完归档；
+2. **禁止用"回合数最多/第一个非归档"之类的启发式来挑会话**去执行写操作 —— 那必然是用户正在用的那个；
+3. `session/cancel` **只允许**作用于本脚本自己创建的会话；对真实会话连"收尾清理"都不许；
+4. 只读操作（`session/follow`、`session/attachment`、`session/state`）可以看真实会话，但也要显式传 `--session`，
+   不要靠猜。
+
 ### 发出的图片变 `［图片］`：附件被服务端持久化（2026-11-11 修复）
 
 **现象**：手机端发出去的图片在对话里只剩一行 `［图片］` 文本，点不开也看不了。
@@ -395,6 +446,7 @@ test/harness-login.mjs     登录页稳定性：不重建/不丢输入/能登录
 test/harness-menus.mjs     模型/权限浮层可退出 + 抽屉折叠 + 空会话折叠，15 项断言（含"不得改动人类会话"守卫）
 test/harness-upload.mjs    附件：任意类型选择、文件上传拿 receipt、图片内联、prompt 组装、换会话清空、布局，14 项断言
 test/harness-attachments.mjs 发出的图片真渲染 + 全屏查看 + 队列条显示/移除，6 项断言
+test/harness-typing.mjs    跑动中打字不被清空/焦点不丢（含真实多步回合），5 项断言
 tools/model-state.mjs      打印某会话的当前模型与 model/selection 条数，用于前后对照
 tools/restore-model.mjs    把会话模型显式恢复为 provider/model
 tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）

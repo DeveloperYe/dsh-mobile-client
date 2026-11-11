@@ -188,6 +188,7 @@
     busy: false,
     lastError: '',
     showInject: lsGet(K.inject, '0') === '1',
+    draft: '',            // what the user has typed but not sent
     pending: [],          // parts waiting to be sent
     queue: [],            // prompts the host still holds because this session is busy
     queueTimer: null,
@@ -475,14 +476,15 @@
   }
 
   // ─────────────────────────────────────────────────────────── sessions
-  function loadSessions() {
+  function loadSessions(opts) {
+    var repaint = !(opts && opts.repaint === false);
     return rpc('session/list', { _request: {} }).then(function (v) {
       S.sessions = (v && v.items) || [];
       S.authed = true;
       S.sessions.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
       try { wsEnsure(); } catch (e) {}
       saveCache();
-      render();
+      if (repaint) render();   // never rebuild the live view just because the list changed
       return S.sessions;
     });
   }
@@ -547,7 +549,7 @@
       if (ev.type === 'todo/write') cur.projections.todos = ev.data.todos;
       appendRecord(cur, frame);
       renderChat(false);
-      if (ev.type === 'assistant/message' || ev.type === 'turn/end') loadSessions().catch(function () {});
+      if (ev.type === 'assistant/message' || ev.type === 'turn/end') loadSessions({ repaint: false }).catch(function () {});
       return;
     }
     if (frame.type === 'assistant-stream' && frame.frame) {
@@ -1503,6 +1505,8 @@
     var ta = document.createElement('textarea');
     ta.rows = 1;
     ta.placeholder = '发消息…';
+    // a rebuild (theme, resize, session refresh) must not eat what was typed
+    if (S.draft) ta.value = S.draft;
 
     var send = el('button', 'send');
     send.type = 'button';
@@ -1518,6 +1522,7 @@
     composerRefs = { ta: ta, send: send, chips: chips, attach: attach, ask: ask, queue: qstrip, box: box };
 
     ta.addEventListener('input', function () {
+      S.draft = ta.value;
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 132) + 'px';
       renderComposer();
@@ -1619,6 +1624,7 @@
     if (!text && !S.pending.length) return;
     if (S.pending.some(function (p) { return p.uploading; })) { toast('文件还在上传，稍等一下'); return; }
     ta.value = ''; ta.style.height = 'auto';
+    S.draft = '';
     var images = S.pending.slice();
     S.pending = [];
     sendPrompt(text, images).then(function () {
@@ -4020,6 +4026,8 @@
   window.__DSHM__ = {
     state: S, rpc: rpc, md: md, login: login, back: goBack,
     refreshQueueForTest: refreshQueue,
+    loadSessions: function (o) { return loadSessions(o); },
+    renderView: function () { return render(); },
     setRpc: function (fn) { rpcOverride = fn; },
     pendingParts: function (text) { return buildPromptParts(text || '', S.pending); },
     addFiles: function (files) { addFiles(files); },
