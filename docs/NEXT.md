@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.11.0 | **发出的图片能看了**（原来渲染成 `［图片］` 文本）：按 `attachmentId` 走 `session/attachment` 取回并内联显示，点开可全屏；**忙时排队**有了可见反馈：队列条显示待发条数、内容、可逐条移除 |
 | 1.10.1 | **附件移到独立一行**（不再挤在横向滚动的 chip 行里）；长文件名中段省略并保留扩展名，删除按钮固定右侧、永远可点；图片显示缩略图 |
 | 1.10.0 | **附件上传补全**：壳层实现 `onShowFileChooser`（原来点"+"在手机上毫无反应）+ 任意文件走 `POST /api/session/uploadFileBinary` 拿 `receiptId` 挂进 prompt；图片仍走内联 base64 |
 | 1.9.3 | 抽屉改为**按工作区归属分组**（与桌面端一致），不属于任何工作区的会话归到「未分组」并在行尾标出所在目录名；顺手清掉测试遗留在 `scratch` 的 7 个空会话 |
@@ -203,6 +204,40 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 **验证**：`test/harness-login.mjs`（未带 cookie 的全新上下文）—— 修前 6 秒内 **6 次重建**、输入被清空、
 控制台刷 5 条 `remote.mux 403`；修后 **0 次重建**、输入保留且保持焦点、登录后正常进列表、控制台干净。
 
+### 发出的图片变 `［图片］`：附件被服务端持久化（2026-11-11 修复）
+
+**现象**：手机端发出去的图片在对话里只剩一行 `［图片］` 文本，点不开也看不了。
+
+**根因（实测记录，不是猜的）**：`session/prompt` 提交的内联 base64 会被 Host **提升为持久附件**，
+所以会话日志里存的不是 `data`，而是：
+
+```json
+{ "type": "image", "attachment": { "attachmentId": "sha256:befa…", "mediaType": "image/png",
+                                   "width": 1082, "height": 2363, "bytes": 58539, "name": "shot.png" } }
+```
+
+而 `blocksText()` 把所有非文本 part 一律折成 `'［图片］'`，于是气泡里就只剩这三个字。
+取回字节要靠 **`session/attachment({sessionId, attachment: ImageAttachmentRef})` → `{attachment, data(base64)}`**。
+
+**修法**：`user/message` 的 item 保留原始 `parts`；气泡按 part 渲染——文本走 markdown、
+图片走 `session/attachment` 拉字节（`attachCache` 按 attachmentId 缓存，重绘不重复拉）、点开全屏查看、
+文件显示名字与大小。`blocksText` 仍保留 `［图片］`，但它只用于复制/搜索摘要，不再用于气泡正文。
+
+### 忙时排队：服务端本来就有，缺的是界面（2026-11-11 补上）
+
+- `session/prompt` 的 `mode` 是 `'queue' | 'steer'`，本端一直用 `queue`；实测（`tools/probe-image-queue2.mjs`）
+  在一轮正在跑时发第二条，`session/state.queue` 立刻多出一条 `placement: 'queued'` —— **服务端排队是生效的**。
+- 但客户端从不读 `session/state`，所以用户看不到自己发的消息去哪了。现在：
+  - 发送后若原本 `running`，toast 提示「已排队，本轮结束后自动发送」；
+  - 输入框上方新增队列条：`排队中 · N 条` + 「本轮结束后自动发送」，逐条显示内容，
+    `placement: 'steering'` 的标「插话」；每条可「移除」（`session/updateQueue {action:{kind:'remove'}}`）；
+  - 队列非空时每 2.5s 刷新一次，空了自动停表并收起；打开会话即拉一次。
+- `QueueAction` 另有 `edit`（纯文本替换）与 `steer`（改成插话），暂未接（界面先只做「看到了 + 能撤回」）。
+
+**测试接缝**：为了不依赖"恰好有一轮在跑"这种时序，给 `rpc` 加了 `rpcOverride`（返回 `undefined` 时走真实传输），
+测试用 `__DSHM__.setRpc()` 注入假 `session/state`。**注意**：桩 `window.__DSHM__.rpc` 是**无效**的，
+应用内部用的是自己的 `rpc` 绑定——这一点在模型菜单那次已经踩过，现在有了正式接缝。
+
 ### 附件的排版：它是内容，不是元信息（2026-11-10 修正）
 
 用户反馈两件事：附件挤在 chip 行里**横向溢出**，且**长文件名时看不到删除按钮**。
@@ -358,7 +393,8 @@ test/harness-sched22.mjs   定时任务 0.2.2：列表/表单新建/暂停/恢�
 test/harness-ui.mjs        桌面化 UI：抽屉/切换/搜索/去气泡/回到底部/代码复制/返回键，12 项断言
 test/harness-login.mjs     登录页稳定性：不重建/不丢输入/能登录，5 项断言
 test/harness-menus.mjs     模型/权限浮层可退出 + 抽屉折叠 + 空会话折叠，15 项断言（含"不得改动人类会话"守卫）
-test/harness-upload.mjs    附件：任意类型选择、文件上传拿 receipt、图片内联、prompt 组装、换会话清空，9 项断言
+test/harness-upload.mjs    附件：任意类型选择、文件上传拿 receipt、图片内联、prompt 组装、换会话清空、布局，14 项断言
+test/harness-attachments.mjs 发出的图片真渲染 + 全屏查看 + 队列条显示/移除，6 项断言
 tools/model-state.mjs      打印某会话的当前模型与 model/selection 条数，用于前后对照
 tools/restore-model.mjs    把会话模型显式恢复为 provider/model
 tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）

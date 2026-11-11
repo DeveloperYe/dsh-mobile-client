@@ -54,31 +54,6 @@
     if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
     return (n / 1048576).toFixed(1) + ' MB';
   }
-  /** Middle-ellipsis shortener: keeps the head *and* the tail (extension) so a
-   *  long attachment name stays recognisable without ever pushing ✕ off screen.
-   *  Budget is in half-width units at the 12.5px chip font (~6.4px each). */
-  function shortName(name, budget) {
-    var chars = Array.from(String(name == null ? '' : name));
-    var half = function (ch) { return /[\u2e80-\u9fff\uff00-\uffef\u3000-\u303f]/.test(ch) ? 2 : 1; };
-    budget = budget || 46;
-    var total = 0, i;
-    for (i = 0; i < chars.length; i++) total += half(chars[i]);
-    if (total <= budget) return chars.join('');
-    var head = [], tail = [], used = 0;
-    var headBudget = Math.round(budget * 0.55), tailBudget = budget - headBudget - 2;
-    for (i = 0; i < chars.length; i++) {
-      var u = half(chars[i]);
-      if (used + u > headBudget) break;
-      used += u; head.push(chars[i]);
-    }
-    used = 0;
-    for (i = chars.length - 1; i >= 0; i--) {
-      var v = half(chars[i]);
-      if (used + v > tailBudget) break;
-      used += v; tail.unshift(chars[i]);
-    }
-    return head.join('') + '…' + tail.join('');
-  }
   function fmtTime(ts) {
     if (!ts) return '';
     var d = new Date(ts), now = Date.now(), diff = now - ts;
@@ -213,7 +188,9 @@
     busy: false,
     lastError: '',
     showInject: lsGet(K.inject, '0') === '1',
-    pending: [],          // queued image parts
+    pending: [],          // parts waiting to be sent
+    queue: [],            // prompts the host still holds because this session is busy
+    queueTimer: null,
     clientId: '',         // $events stream generation id (required for every reply)
     forwardId: null,      // $events stream handle
     interactive: [],      // unanswered approval / user-question requests
@@ -247,7 +224,12 @@
   function ApiError(message, code, details) { this.message = message; this.code = code; this.details = details; }
   ApiError.prototype = Object.create(Error.prototype);
 
+  var rpcOverride = null;
   function rpc(method, args) {
+    if (rpcOverride) {
+      var overridden = rpcOverride(method, args);
+      if (overridden !== undefined) return overridden;
+    }
     var rpcId = uuid();
     return fetch(S.server + '/api/' + method, {
       method: 'POST',
@@ -506,13 +488,14 @@
   }
 
   function openSession(id, title) {
-    if (S.cur && S.cur.id !== id) S.pending = [];   // upload receipts belong to one session
+    if (S.cur && S.cur.id !== id) { S.pending = []; S.queue = []; }   // receipts and queues belong to one session
 
     if (S.cur && S.cur.followId) { S.mux && S.mux.closeStream(S.cur.followId); }
     S.cur = { id: id, title: title || '会话', records: [], live: null, header: null, hasMore: false, throughSeq: 0, running: false, projections: {}, followId: null, loaded: false };
     S.view = 'chat';
     render();
     attachFollow();
+    refreshQueue();
   }
 
   function attachFollow() {
@@ -617,6 +600,7 @@
 
   function sendPrompt(text, pending) {
     if (!S.cur) return Promise.resolve();
+    var wasBusy = !!S.cur.running;
     var content = buildPromptParts(text, pending);
     if (!content.length) return Promise.resolve();
     return rpc('session/prompt', {
@@ -624,6 +608,8 @@
     }).then(function () {
       S.cur.running = true;
       renderComposer();
+      if (wasBusy) toast('已排队，本轮结束后自动发送');
+      refreshQueue();
     });
   }
 
@@ -643,7 +629,10 @@
       case 'user/message': {
         var kind = (d.source && d.source.kind) || 'user';
         if (kind !== 'user' && !S.showInject) return null;   // injected context: noise on a phone
-        return { kind: kind === 'user' ? 'user' : 'inject', seq: ev.seq, text: blocksText(d.content), meta: kind };
+        return {
+          kind: kind === 'user' ? 'user' : 'inject', seq: ev.seq,
+          text: blocksText(d.content), parts: d.content || [], meta: kind
+        };
       }
       case 'assistant/message':
         return { kind: 'assistant', seq: ev.seq, blocks: (d.message && d.message.content) || [], usage: d.usage, model: d.message && d.message.source };
@@ -666,6 +655,79 @@
       default:
         return null;
     }
+  }
+
+  // ── durable prompt attachments ───────────────────────────────────────────
+  // The Host promotes submitted bytes to a sha256 reference, so a sent image is no
+  // longer base64 in the log: { type:'image', attachment:{attachmentId, mediaType, …} }
+  // and the bytes must be read back through session/attachment.
+  var attachCache = {};
+
+  function attachRefOf(part) {
+    if (!part) return null;
+    if (part.attachment) return part.attachment;
+    if (part.attachmentId) return part;
+    return null;
+  }
+
+  function imageDataUrl(ref, cb) {
+    if (!ref || !ref.attachmentId || !S.cur) return cb(null);
+    if (attachCache[ref.attachmentId]) return cb(attachCache[ref.attachmentId]);
+    rpc('session/attachment', { request: { sessionId: S.cur.id, attachment: ref } }).then(function (v) {
+      var url = 'data:' + (ref.mediaType || 'image/png') + ';base64,' + (v && v.data);
+      attachCache[ref.attachmentId] = url;
+      cb(url);
+    }).catch(function (e) { cb(null, e); });
+  }
+
+  /** Tap a picture to see it full screen; tap again to close. */
+  function viewImage(url) {
+    var back = el('div', 'imgview');
+    var img = document.createElement('img');
+    img.src = url;
+    back.appendChild(img);
+    back.addEventListener('click', function () { back.remove(); });
+    document.body.appendChild(back);
+  }
+
+  function renderMessageParts(node, parts) {
+    parts.forEach(function (p) {
+      if (!p || typeof p !== 'object') return;
+      if (p.type === 'text') {
+        if (!(p.text || '').trim()) return;
+        var t = el('div', 'part-text');
+        t.innerHTML = md(p.text);
+        node.appendChild(t);
+        return;
+      }
+      var ref = attachRefOf(p);
+      if (p.type === 'image') {
+        var box = el('div', 'part-img');
+        var img = document.createElement('img');
+        img.alt = (ref && ref.name) || '图片';
+        box.appendChild(img);
+        box.appendChild(el('div', 'part-img-hint', '加载中…'));
+        imageDataUrl(ref, function (url, err) {
+          var hint = box.querySelector('.part-img-hint');
+          if (url) {
+            if (hint) hint.remove();
+            img.src = url;
+            img.addEventListener('click', function () { viewImage(url); });
+          } else if (hint) {
+            hint.textContent = err ? '图片加载失败：' + err.message : '图片不可用';
+          }
+        });
+        node.appendChild(box);
+        return;
+      }
+      if (p.type === 'file') {
+        var row = el('div', 'part-file');
+        row.appendChild(el('span', 'part-file-ic', '📄'));
+        row.appendChild(el('span', 'part-file-name', midEllipsis((ref && ref.name) || '文件', 26)));
+        if (ref && ref.bytes) row.appendChild(el('span', 'part-file-size', fmtBytes(ref.bytes)));
+        node.appendChild(row);
+      }
+    });
   }
 
   function blocksText(content) {
@@ -1260,7 +1322,9 @@
     var node = null;
     if (item.kind === 'user') {
       node = el('div', 'msg user');
-      node.innerHTML = md(item.text);
+      var rich = (item.parts || []).some(function (p) { return p && p.type && p.type !== 'text'; });
+      if (rich) renderMessageParts(node, item.parts);
+      else node.innerHTML = md(item.text);
       attachLongPress(node, function () { msgActions(item); });
     } else if (item.kind === 'inject') {
       if (!item.text) return;
@@ -1418,6 +1482,9 @@
     var box = el('div', 'composer');
     var ask = el('div', 'ask-slot');
     box.appendChild(ask);
+    var qstrip = el('div', 'queuestrip');
+    qstrip.hidden = true;
+    box.appendChild(qstrip);
     var chips = el('div', 'chips');
     box.appendChild(chips);
     // Attachments are content, not metadata: they need a full-width row of their own,
@@ -1426,9 +1493,6 @@
     var attach = el('div', 'attachbar');
     attach.hidden = true;
     box.appendChild(attach);
-    // 待发附件单独一行，不跟状态 chip 抢同一行
-    var atts = el('div', 'atts');
-    box.appendChild(atts);
 
     var line = el('div', 'line');
     var file = document.createElement('input');
@@ -1451,7 +1515,7 @@
     box.appendChild(line);
     box.appendChild(file);
 
-    composerRefs = { ta: ta, send: send, chips: chips, attach: attach, ask: ask, box: box };
+    composerRefs = { ta: ta, send: send, chips: chips, attach: attach, ask: ask, queue: qstrip, box: box };
 
     ta.addEventListener('input', function () {
       ta.style.height = 'auto';
@@ -1862,6 +1926,54 @@
       });
       row.appendChild(x);
 
+      bar.appendChild(row);
+    });
+  }
+
+  /** Read what the Host still holds for this session (session/state.queue). */
+  function refreshQueue() {
+    if (!S.cur) return;
+    var sid = S.cur.id;
+    rpc('session/state', { request: { sessionId: sid } }).then(function (st) {
+      if (!S.cur || S.cur.id !== sid) return;
+      var q = (st && st.queue) || [];
+      S.queue = q.map(function (it) {
+        return { id: it.id, placement: it.placement, text: blocksText(it.content) || '', parts: it.content || [] };
+      });
+      renderQueueStrip();
+      if (S.queue.length && !S.queueTimer) {
+        S.queueTimer = setInterval(function () {
+          if (!S.cur || !S.queue.length) { clearInterval(S.queueTimer); S.queueTimer = null; return; }
+          refreshQueue();
+        }, 2500);
+      }
+    }).catch(function () {});
+  }
+
+  function renderQueueStrip() {
+    var bar = composerRefs.queue;
+    if (!bar) return;
+    bar.innerHTML = '';
+    bar.hidden = !(S.queue && S.queue.length);
+    if (bar.hidden) return;
+    var head = el('div', 'qhead');
+    head.appendChild(el('span', 'qlabel', '排队中 · ' + S.queue.length + ' 条'));
+    head.appendChild(el('span', 'qhint', '本轮结束后自动发送'));
+    bar.appendChild(head);
+    S.queue.forEach(function (q) {
+      var row = el('div', 'qrow');
+      var txt = el('div', 'qtext', midEllipsis(q.text || '（附件）', 46));
+      txt.title = q.text || '';
+      row.appendChild(txt);
+      if (q.placement === 'steering') row.appendChild(el('span', 'qtag', '插话'));
+      var rm = el('button', 'qrm', '移除');
+      rm.type = 'button';
+      rm.addEventListener('click', function () {
+        rpc('session/updateQueue', { request: { sessionId: S.cur.id, itemId: q.id, action: { kind: 'remove' } } })
+          .then(function () { toast('已从队列移除'); refreshQueue(); })
+          .catch(function (e) { toast('移除失败：' + e.message); });
+      });
+      row.appendChild(rm);
       bar.appendChild(row);
     });
   }
@@ -3907,6 +4019,8 @@
 
   window.__DSHM__ = {
     state: S, rpc: rpc, md: md, login: login, back: goBack,
+    refreshQueueForTest: refreshQueue,
+    setRpc: function (fn) { rpcOverride = fn; },
     pendingParts: function (text) { return buildPromptParts(text || '', S.pending); },
     addFiles: function (files) { addFiles(files); },
     pending: function () { return S.pending.slice(); },

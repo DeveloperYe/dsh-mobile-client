@@ -168,14 +168,13 @@ pre code { background: none; padding: 0; font-size: inherit; }
   flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--bg);
   padding: 8px 10px calc(var(--sab) + 8px) 10px; display: flex; flex-direction: column; gap: 7px;
 }
-/* 换行而不是横向滚动：任何 chip（尤其带删除标记的附件）都不许被切到屏幕外 */
+/* 换行而不是横向滚动：状态 chip 再多也不许被切到屏幕外（附件另占行，见 .attachbar） */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; max-height: 104px; overflow-y: auto; }
 .chip {
   flex: 0 0 auto; font-size: 12px; padding: 5px 10px; border-radius: 999px;
   background: var(--bg-elev2); border: 1px solid var(--line); color: var(--fg-dim);
   white-space: nowrap; max-width: 62vw; overflow: hidden; text-overflow: ellipsis;
 }
-/* 附件 chip：文件名可缩可省略，删除标记固定在最右且永不参与截断 */
 .chip.on { border-color: var(--accent); color: var(--fg); }
 .chip.run { color: var(--ok); }
 .composer .attachbar {
@@ -444,3 +443,55 @@ pre code { background: none; padding: 0; font-size: inherit; }
 .chipmenu-cancel { padding: 10px 14px; margin-top: 4px; border-top: 1px solid var(--line); color: var(--fg-dim); }
 .chipmenu-cancel:active { background: var(--bg-elev2); }
 
+/* ---------- attachments inside a sent message ---------- */
+.msg.user .part-text { margin: 0 0 4px; }
+.msg.user .part-text:last-child { margin-bottom: 0; }
+.msg.user .part-img {
+  position: relative; margin: 6px 0 2px; border-radius: 12px; overflow: hidden;
+  background: rgba(127,127,127,.12); min-height: 72px; max-width: 100%;
+}
+.msg.user .part-img img { display: block; max-width: 100%; height: auto; border-radius: 12px; }
+.msg.user .part-img-hint {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; color: var(--fg-faint);
+}
+.msg.user .part-file {
+  display: flex; align-items: center; gap: 7px; min-width: 0; margin-top: 6px;
+  padding: 6px 9px; border-radius: 10px; background: rgba(127,127,127,.14);
+}
+.msg.user .part-file-ic { flex: 0 0 auto; }
+.msg.user .part-file-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.msg.user .part-file-size { flex: 0 0 auto; font-size: 11px; color: var(--fg-faint); }
+
+/* full-screen picture viewer */
+.imgview {
+  position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,.92); padding: calc(var(--sat) + 12px) 12px calc(var(--sab) + 12px);
+  animation: paneIn .12s ease;
+}
+.imgview img { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+/* ---------- queue strip (host holds prompts while a turn runs) ---------- */
+.queuestrip {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 7px 8px; border-radius: 11px; border: 1px solid var(--line);
+  background: rgba(127,127,127,.09); max-height: 132px; overflow-y: auto;
+}
+.queuestrip[hidden] { display: none; }
+.queuestrip .qhead { display: flex; align-items: baseline; gap: 8px; }
+.queuestrip .qlabel { font-size: 12px; font-weight: 600; color: var(--fg-dim); }
+.queuestrip .qhint { font-size: 11px; color: var(--fg-faint); }
+.queuestrip .qrow { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.queuestrip .qtext {
+  flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--fg-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.queuestrip .qtag {
+  flex: 0 0 auto; font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--fg-faint);
+}
+.queuestrip .qrm {
+  flex: 0 0 auto; padding: 4px 9px; border-radius: 8px; border: 1px solid var(--line);
+  background: transparent; color: var(--fg-dim); font-size: 11.5px;
+}
+.queuestrip .qrm:active { background: rgba(127,127,127,.2); }
