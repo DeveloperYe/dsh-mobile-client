@@ -850,6 +850,38 @@
     mount(wrap);
   }
 
+  /**
+   * Mirrors the Host's own flattenLineage: a subagent row whose parent is also present is
+   * emitted directly under that parent with depth+1 instead of standing beside it as a
+   * peer. Ordinary forks keep a parent id without being subagents, so they stay at the
+   * top level, and an orphan subagent (parent not in the list) degrades to the top level
+   * rather than disappearing.
+   */
+  function flattenLineage(rows) {
+    var byId = {}, children = {}, roots = [], out = [], seen = {};
+    rows.forEach(function (x) { byId[x.sessionId] = x; });
+    rows.forEach(function (x) {
+      if (x.origin === 'subagent' && x.parentSessionId && byId[x.parentSessionId]) {
+        var list = children[x.parentSessionId] || (children[x.parentSessionId] = []);
+        list.push(x);
+      } else {
+        roots.push(x);
+      }
+    });
+    function walk(x, depth) {
+      if (seen[x.sessionId]) return;
+      seen[x.sessionId] = 1;
+      var row = {};
+      for (var k in x) if (Object.prototype.hasOwnProperty.call(x, k)) row[k] = x[k];
+      row.depth = depth;
+      out.push(row);
+      (children[x.sessionId] || []).forEach(function (kid) { walk(kid, depth + 1); });
+    }
+    roots.forEach(function (x) { walk(x, 0); });
+    rows.forEach(function (x) { if (!seen[x.sessionId]) walk(x, 0); });   // cycles: never drop a row
+    return out;
+  }
+
   function visibleSessions() {
     var q = (S.query || '').trim().toLowerCase();
     var live = S.sessions.filter(function (s) { return !isArchived(s.sessionId); });
@@ -857,10 +889,10 @@
       var title = (s.projections && s.projections.values && (s.projections.values.title || '')) || '';
       return title.toLowerCase().indexOf(q) >= 0 || (s.cwd || '').toLowerCase().indexOf(q) >= 0;
     });
-    if (!S.ws || !S.ws.pinned.length) return rows;
+    if (!S.ws || !S.ws.pinned.length) return flattenLineage(rows);
     var pin = [], rest = [];
     rows.forEach(function (s) { (isPinned(s.sessionId) ? pin : rest).push(s); });
-    return pin.concat(rest);
+    return flattenLineage(pin.concat(rest));
   }
 
   function toggleSearch() {
@@ -881,8 +913,11 @@
   }
 
   function sessionRow(s) {
-    var row = el('div', 'row');
+    var depth = s.depth || 0;
+    var row = el('div', 'row' + (depth ? ' sub' : ''));
     row.dataset.id = s.sessionId;
+    row.dataset.depth = String(depth);
+    if (depth) row.style.paddingLeft = (10 + depth * 16) + 'px';
     var dot = el('div', 'dot ' + (s.running ? 'run' : 'idle'));
     row.appendChild(dot);
     var g = el('div', 'grow');
@@ -894,6 +929,7 @@
     m.appendChild(p);
     if (isPinned(s.sessionId)) m.appendChild(el('span', 'tag', '★ 置顶'));
     if (s.origin === 'subagent') m.appendChild(el('span', 'tag', '子代理'));
+    else if (s.parentSessionId) m.appendChild(el('span', 'tag', '分叉'));
     g.appendChild(m);
     row.appendChild(g);
     row.addEventListener('click', function () { openSession(s.sessionId, title); });
@@ -913,7 +949,13 @@
     var cur = S.cur;
     var frag = document.createDocumentFragment();
     var title = cur.projections.title || cur.title || '会话';
-    frag.appendChild(header(title, '', [
+    var self = byId(cur.id);
+    var sub = '';
+    if (self && self.origin === 'subagent') {
+      var p = self.parentSessionId ? byId(self.parentSessionId) : null;
+      sub = '子代理' + (p ? ' · 父会话：' + (((p.projections || {}).values || {}).title || p.sessionId) : '');
+    }
+    frag.appendChild(header(title, sub, [
       { icon: 'more', label: '菜单', on: function () { chatMenu(); } }
     ], [
       { icon: 'menu', label: '会话列表', on: openDrawer }
@@ -1022,8 +1064,9 @@
       }
 
       groups.forEach(function (grp) {
-        var blank = grp.items.filter(function (x) { return x.blank && !isPinned(x.sessionId); });
-        var real = grp.items.filter(function (x) { return !(x.blank && !isPinned(x.sessionId)); });
+        var laid = flattenLineage(grp.items);
+        var blank = laid.filter(function (x) { return x.blank && !isPinned(x.sessionId); });
+        var real = laid.filter(function (x) { return !(x.blank && !isPinned(x.sessionId)); });
         var collapsed = !!S.collapsedCwds[grp.key];
 
         var head = el('div', 'dgroup' + (collapsed ? '' : ' open'));
@@ -1040,11 +1083,15 @@
         if (collapsed) return;
 
         function addRow(x, showFolder) {
-          var r = el('div', 'drow' + (S.cur && S.cur.id === x.sessionId ? ' cur' : ''));
+          var depth = x.depth || 0;
+          var r = el('div', 'drow' + (S.cur && S.cur.id === x.sessionId ? ' cur' : '') + (depth ? ' sub' : ''));
+          r.dataset.depth = String(depth);
+          if (depth) r.style.paddingLeft = (10 + depth * 14) + 'px';
           r.appendChild(el('div', 'dot ' + (x.running ? 'run' : 'idle')));
           var t = (x.projections && x.projections.values && x.projections.values.title)
             || (x.blank ? '空会话' : '（无标题）');
-          r.appendChild(el('div', 'dt', (isPinned(x.sessionId) ? '★ ' : '') + t));
+          var prefix = (isPinned(x.sessionId) ? '★ ' : '') + (depth ? '↳ ' : '');
+          r.appendChild(el('div', 'dt', prefix + t));
           var meta = el('div', 'dm', fmtTime(x.updatedAt));
           if (showFolder && x.cwd) meta.textContent = baseName(x.cwd) + ' · ' + fmtTime(x.updatedAt);
           r.appendChild(meta);

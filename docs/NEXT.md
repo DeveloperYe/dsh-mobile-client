@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.11.2 | **子代理会话不再和正常会话并列**：照 Host 的 `flattenLineage` 规则缩进挂到父会话下（父不在列表时退化为顶层、绝不丢）；分叉会话仍并列并标「分叉」；打开子代理时标题栏标明「子代理 · 父会话」 |
 | 1.11.1 | **修「每推进一步就刷新聊天框、打不进字」**：follow 流每来一条 `assistant/message` 都会调 `loadSessions()`，而它结尾 `render()` 重建整页（textarea 被销毁、焦点丢失）；现在列表刷新不再重绘当前视图，另加草稿保留兜底 |
 | 1.11.0 | **发出的图片能看了**（原来渲染成 `［图片］` 文本）：按 `attachmentId` 走 `session/attachment` 取回并内联显示，点开可全屏；**忙时排队**有了可见反馈：队列条显示待发条数、内容、可逐条移除 |
 | 1.10.1 | **附件移到独立一行**（不再挤在横向滚动的 chip 行里）；长文件名中段省略并保留扩展名，删除按钮固定右侧、永远可点；图片显示缩略图 |
@@ -204,6 +205,28 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 
 **验证**：`test/harness-login.mjs`（未带 cookie 的全新上下文）—— 修前 6 秒内 **6 次重建**、输入被清空、
 控制台刷 5 条 `remote.mux 403`；修后 **0 次重建**、输入保留且保持焦点、登录后正常进列表、控制台干净。
+
+### 子代理会话为什么和正常会话并列（2026-11-12 修复）
+
+**现象**：子代理（subagent）会话在会话列表/抽屉里和普通会话平铺并列，看起来像一堆重复的会话。
+
+**桌面端的规则**（`dsh-api-session-controller/lib/types/client/sessions/lineage.js` 的 `flattenLineage`，
+原文注释写得很清楚）：
+
+- `origin === 'subagent'` **且** 父会话也在列表里 → 变成父会话的**子行**（`depth + 1`），紧挨父会话渲染；
+- **普通分叉（fork）**虽然也带 `parentSessionId`，但 `origin` 不是 subagent → **仍是顶层**（注释：*"Historical ordinary forks may retain a parent id without being subagents"*）；
+- 父会话不在列表里（孤儿）→ **退化为顶层，绝不丢**；有环时也当顶层输出。
+
+本端原来只给子代理打了个「子代理」标签（`app.js:896`），没有任何层级处理，所以看着就是并列。
+
+**修法**：把 `flattenLineage` 一模一样的纯函数搬进 `app.js`，列表（`visibleSessions`）与抽屉（按工作区分组后）
+都走它；缩进行加左侧竖线 + `↳` + 「子代理」标签，分叉行标「分叉」；打开子代理时标题栏显示
+「子代理 · 父会话：<父标题>」。**没有隐藏任何会话** —— 与桌面端一致：缩进而不是丢弃。
+
+**实测数据**（当时列表）：130 个会话，其中 `origin === 'subagent'` 3 个（全部能嵌套）、
+带 `parentSessionId` 但非子代理的**分叉 4 个**（必须保持并列）。`harness-lineage` 7/7：
+缩进行确实是子代理且紧跟其父、父在列表里的子代理 0 个并列、分叉仍并列且有标签、抽屉同样嵌套、
+打开子代理时标明父会话。
 
 ### 每推进一步就刷新、打不进字（2026-11-11 修复）
 
@@ -447,6 +470,7 @@ test/harness-menus.mjs     模型/权限浮层可退出 + 抽屉折叠 + 空会�
 test/harness-upload.mjs    附件：任意类型选择、文件上传拿 receipt、图片内联、prompt 组装、换会话清空、布局，14 项断言
 test/harness-attachments.mjs 发出的图片真渲染 + 全屏查看 + 队列条显示/移除，6 项断言
 test/harness-typing.mjs    跑动中打字不被清空/焦点不丢（含真实多步回合），5 项断言
+test/harness-lineage.mjs   子代理缩进挂父会话、分叉仍并列、父会话提示，7 项断言
 tools/model-state.mjs      打印某会话的当前模型与 model/selection 条数，用于前后对照
 tools/restore-model.mjs    把会话模型显式恢复为 provider/model
 tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）
