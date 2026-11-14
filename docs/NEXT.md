@@ -12,6 +12,7 @@
 | 1.3.0 | 文件浏览器 + 文本预览、后台任务（含结束）、长期目标、模型供应商/插件清单 |
 | 1.4.0 | 轨迹视图（按回合聚合步数/工具/耗时，点击跳转） |
 | 1.5.0 | 会话信息面板（计划/待办/交付物/子代理/用量） |
+| 1.11.3 | **子代理彻底移出会话列表**（1.11.2 的缩进挂在父会话下被否掉了）；改成从**父会话的信息面板 → 子代理**进入，用 `{kind:'subagent', parentSessionId, childSessionId, mode}` 地址读取（普通会话地址会被 Host 拒绝，这正是「点不进去」的原因）；子代理视图只读、可一键回到父会话 |
 | 1.11.2 | **子代理会话不再和正常会话并列**：照 Host 的 `flattenLineage` 规则缩进挂到父会话下（父不在列表时退化为顶层、绝不丢）；分叉会话仍并列并标「分叉」；打开子代理时标题栏标明「子代理 · 父会话」 |
 | 1.11.1 | **修「每推进一步就刷新聊天框、打不进字」**：follow 流每来一条 `assistant/message` 都会调 `loadSessions()`，而它结尾 `render()` 重建整页（textarea 被销毁、焦点丢失）；现在列表刷新不再重绘当前视图，另加草稿保留兜底 |
 | 1.11.0 | **发出的图片能看了**（原来渲染成 `［图片］` 文本）：按 `attachmentId` 走 `session/attachment` 取回并内联显示，点开可全屏；**忙时排队**有了可见反馈：队列条显示待发条数、内容、可逐条移除 |
@@ -206,7 +207,46 @@ skills/list({sessionId})                             -> {skills:[{name, descript
 **验证**：`test/harness-login.mjs`（未带 cookie 的全新上下文）—— 修前 6 秒内 **6 次重建**、输入被清空、
 控制台刷 5 条 `remote.mux 403`；修后 **0 次重建**、输入保留且保持焦点、登录后正常进列表、控制台干净。
 
-### 子代理会话为什么和正常会话并列（2026-11-12 修复）
+### 子代理：不该出现在列表里，而且普通地址根本读不到（2026-11-15 修正）
+
+1.11.2 我按桌面端 `flattenLineage` 把子代理**缩进挂在父会话下**，用户否掉：「子代理就不应该显示在那里，点都点不进去」。
+两件事都要处理。
+
+**「点不进去」的真正原因（Host 源码给的，不是推测）**：`dsh-api-session-controller/lib/index.js` 的
+`validateAddress` 对普通会话地址直接抛错：
+
+```
+if (header.origin === "subagent") throw new RemoteError("session/agent-busy",
+  "subagent Sessions require their durable parent address",
+  { reason: "use subagent delivery for this child session" })
+```
+
+也就是说子代理**必须**用父地址寻址：`SessionAddress = { kind:'subagent', parentSessionId, childSessionId, mode }`
+（`types.d.ts` L386）。本端 `openSession` 一直发 `{kind:'session'}`，所以永远打不开。
+
+**实测（`tools/probe-subagent-open.mjs`，只读）**：
+
+| 地址 | 结果 |
+|---|---|
+| `{kind:'session', sessionId:<子>}` | **REFUSED** — `session/agent-busy`「subagent Sessions require their durable parent address」 |
+| `{kind:'subagent', parentSessionId, childSessionId, mode:'unknown'}` | **accepted**，读回 23 条记录（`mode` 用 unknown 即可，无需先查目录） |
+
+**改法**：
+
+1. 会话列表与抽屉**完全排除** `origin === 'subagent'`（不再缩进、不再显示）；`flattenLineage` 删除。
+2. 新增 `openSessionAddr(addr, title, readonly)`；`openSession` 只是它的 `{kind:'session'}` 封装，
+   `session/follow` 与 `session/page` 都改用 `cur.addr`。
+3. **子代理视图只读**：不渲染输入框，底部一条「子代理会话 · 只读 / 回到父会话」；标题栏显示
+   「子代理 · 只读 · 父会话：<父标题>」；`refreshQueue` 对子代理直接跳过（`session/state` 不接受子代理地址）。
+4. 入口放在**父会话的信息面板**：`会话信息 → 子代理 N` 列出该父会话的全部子代理（标题、mode、运行状态/时间），
+   点击用父地址打开。数据来自本地已有的 `S.sessions`（`childrenOf(parentId)`），并合并 `subagent/catalog`
+   事件补 mode。
+
+**实测（`test/harness-subagents.mjs`，7/7）**：41 个活会话中含 18 个子代理 → 列表行 23、**泄漏 0**；
+抽屉同样 0 泄漏；父会话信息面板列出 6 个子代理；点进去 `addr.kind === 'subagent'`、**读到 305 条记录**、
+无输入框、有只读条；「回到父会话」返回父会话并恢复输入框。
+
+### 子代理会话为什么和正常会话并列（2026-11-12，已被 1.11.3 取代）
 
 **现象**：子代理（subagent）会话在会话列表/抽屉里和普通会话平铺并列，看起来像一堆重复的会话。
 
@@ -470,7 +510,7 @@ test/harness-menus.mjs     模型/权限浮层可退出 + 抽屉折叠 + 空会�
 test/harness-upload.mjs    附件：任意类型选择、文件上传拿 receipt、图片内联、prompt 组装、换会话清空、布局，14 项断言
 test/harness-attachments.mjs 发出的图片真渲染 + 全屏查看 + 队列条显示/移除，6 项断言
 test/harness-typing.mjs    跑动中打字不被清空/焦点不丢（含真实多步回合），5 项断言
-test/harness-lineage.mjs   子代理缩进挂父会话、分叉仍并列、父会话提示，7 项断言
+test/harness-subagents.mjs 子代理不在列表/抽屉、父面板可进入、只读视图、回到父会话，7 项断言
 tools/model-state.mjs      打印某会话的当前模型与 model/selection 条数，用于前后对照
 tools/restore-model.mjs    把会话模型显式恢复为 provider/model
 tools/refresh-state.mjs    升级后重抓登录 cookie（recon/traffic.storage.json）

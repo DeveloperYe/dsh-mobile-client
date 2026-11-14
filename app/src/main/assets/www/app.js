@@ -489,14 +489,35 @@
     });
   }
 
-  function openSession(id, title) {
-    if (S.cur && S.cur.id !== id) { S.pending = []; S.queue = []; }   // receipts and queues belong to one session
+  /**
+   * A subagent sits behind a durable parent address: {kind:'subagent', parentSessionId,
+   * childSessionId, mode}. Addressing it as an ordinary session is refused by the Host
+   * with session/agent-busy, which is why tapping one in the list did nothing.
+   */
+  function openSubagentSession(parentId, childId, title) {
+    var child = byId(childId);
+    var mode = (child && child.subagentMode) || 'unknown';
+    openSessionAddr({ kind: 'subagent', parentSessionId: parentId, childSessionId: childId, mode: mode }, title, true);
+  }
 
+  function openSessionAddr(addr, title, readonly) {
+    var id = addr.kind === 'subagent' ? addr.childSessionId : addr.sessionId;
     if (S.cur && S.cur.followId) { S.mux && S.mux.closeStream(S.cur.followId); }
-    S.cur = { id: id, title: title || '会话', records: [], live: null, header: null, hasMore: false, throughSeq: 0, running: false, projections: {}, followId: null, loaded: false };
+    S.pending = []; S.queue = [];
+    S.cur = {
+      id: id, addr: addr, readonly: !!readonly, title: title || '会话',
+      records: [], live: null, header: null, hasMore: false, throughSeq: 0,
+      running: false, projections: {}, followId: null, loaded: false
+    };
     S.view = 'chat';
     render();
     attachFollow();
+    if (!S.cur.readonly) refreshQueue();
+  }
+
+  function openSession(id, title) {
+    if (S.cur && S.cur.id !== id) { S.pending = []; S.queue = []; }   // receipts and queues belong to one session
+    openSessionAddr({ kind: 'session', sessionId: id }, title, false);
     refreshQueue();
   }
 
@@ -505,7 +526,7 @@
     if (!cur) return;
     var args = {
       request: {
-        address: { kind: 'session', sessionId: cur.id },
+        address: cur.addr || { kind: 'session', sessionId: cur.id },
         assistantStream: true,
         maxMessages: 200,
         turnWindow: { minMessages: 30, minTurns: 1 }
@@ -857,29 +878,12 @@
    * top level, and an orphan subagent (parent not in the list) degrades to the top level
    * rather than disappearing.
    */
-  function flattenLineage(rows) {
-    var byId = {}, children = {}, roots = [], out = [], seen = {};
-    rows.forEach(function (x) { byId[x.sessionId] = x; });
-    rows.forEach(function (x) {
-      if (x.origin === 'subagent' && x.parentSessionId && byId[x.parentSessionId]) {
-        var list = children[x.parentSessionId] || (children[x.parentSessionId] = []);
-        list.push(x);
-      } else {
-        roots.push(x);
-      }
-    });
-    function walk(x, depth) {
-      if (seen[x.sessionId]) return;
-      seen[x.sessionId] = 1;
-      var row = {};
-      for (var k in x) if (Object.prototype.hasOwnProperty.call(x, k)) row[k] = x[k];
-      row.depth = depth;
-      out.push(row);
-      (children[x.sessionId] || []).forEach(function (kid) { walk(kid, depth + 1); });
-    }
-    roots.forEach(function (x) { walk(x, 0); });
-    rows.forEach(function (x) { if (!seen[x.sessionId]) walk(x, 0); });   // cycles: never drop a row
-    return out;
+  /** Subagent sessions belong to their parent, not to the session list. */
+  function isSubagent(x) { return !!(x && x.origin === 'subagent'); }
+
+  /** The children a parent owns, straight from the list we already hold. */
+  function childrenOf(parentId) {
+    return S.sessions.filter(function (x) { return isSubagent(x) && x.parentSessionId === parentId; });
   }
 
   function visibleSessions() {
@@ -889,10 +893,11 @@
       var title = (s.projections && s.projections.values && (s.projections.values.title || '')) || '';
       return title.toLowerCase().indexOf(q) >= 0 || (s.cwd || '').toLowerCase().indexOf(q) >= 0;
     });
-    if (!S.ws || !S.ws.pinned.length) return flattenLineage(rows);
+    rows = rows.filter(function (s) { return !isSubagent(s); });
+    if (!S.ws || !S.ws.pinned.length) return rows;
     var pin = [], rest = [];
     rows.forEach(function (s) { (isPinned(s.sessionId) ? pin : rest).push(s); });
-    return flattenLineage(pin.concat(rest));
+    return pin.concat(rest);
   }
 
   function toggleSearch() {
@@ -949,11 +954,11 @@
     var cur = S.cur;
     var frag = document.createDocumentFragment();
     var title = cur.projections.title || cur.title || '会话';
-    var self = byId(cur.id);
+    var parentId = cur.addr && cur.addr.kind === 'subagent' ? cur.addr.parentSessionId : null;
     var sub = '';
-    if (self && self.origin === 'subagent') {
-      var p = self.parentSessionId ? byId(self.parentSessionId) : null;
-      sub = '子代理' + (p ? ' · 父会话：' + (((p.projections || {}).values || {}).title || p.sessionId) : '');
+    if (parentId) {
+      var pp = byId(parentId);
+      sub = '子代理 · 只读' + (pp ? ' · 父会话：' + (((pp.projections || {}).values || {}).title || '未命名') : '');
     }
     frag.appendChild(header(title, sub, [
       { icon: 'more', label: '菜单', on: function () { chatMenu(); } }
@@ -978,7 +983,23 @@
       var away = log.scrollHeight - log.scrollTop - log.clientHeight > 220;
       jump.classList.toggle('on', away);
     }, { passive: true });
-    frag.appendChild(composer());
+    if (cur.readonly) {
+      var foot = el('div', 'subfoot');
+      foot.appendChild(el('span', 'subfoot-note', '子代理会话 · 只读'));
+      var back = el('button', 'btn ghost', '回到父会话');
+      back.style.flex = '0 0 auto';
+      back.addEventListener('click', function () {
+        var parentId = cur.addr && cur.addr.parentSessionId;
+        var p = parentId ? byId(parentId) : null;
+        if (!parentId) { leaveChat(); return; }
+        openSession(parentId, (p && ((p.projections || {}).values || {}).title) || '父会话');
+      });
+      foot.appendChild(back);
+      frag.appendChild(foot);
+      composerRefs = {};
+    } else {
+      frag.appendChild(composer());
+    }
     mount(frag);
     chatRefs.log = log;
     chatRefs.statline = line;
@@ -1020,7 +1041,7 @@
     function paint() {
       list.innerHTML = '';
       var qs = (S.drawerQuery || '').trim().toLowerCase();
-      var live = S.sessions.filter(function (x) { return !isArchived(x.sessionId); });
+      var live = S.sessions.filter(function (x) { return !isArchived(x.sessionId) && !isSubagent(x); });
       if (qs) {
         live = live.filter(function (x) {
           var t = (x.projections && x.projections.values && (x.projections.values.title || '')) || '';
@@ -1064,7 +1085,7 @@
       }
 
       groups.forEach(function (grp) {
-        var laid = flattenLineage(grp.items);
+        var laid = grp.items;
         var blank = laid.filter(function (x) { return x.blank && !isPinned(x.sessionId); });
         var real = laid.filter(function (x) { return !(x.blank && !isPinned(x.sessionId)); });
         var collapsed = !!S.collapsedCwds[grp.key];
@@ -1359,7 +1380,7 @@
     if (!oldest) { btn.remove(); return; }
     btn.textContent = '载入中…';
     rpc('session/page', {
-      request: { address: { kind: 'session', sessionId: cur.id }, throughSeq: cur.throughSeq, beforeSeq: oldest, maxMessages: 100, turnWindow: { minMessages: 20, minTurns: 1 } }
+      request: { address: cur.addr || { kind: 'session', sessionId: cur.id }, throughSeq: cur.throughSeq, beforeSeq: oldest, maxMessages: 100, turnWindow: { minMessages: 20, minTurns: 1 } }
     }).then(function (page) {
       cur.records = (page.records || []).concat(cur.records);
       cur.hasMore = !!page.hasMore;
@@ -1985,7 +2006,7 @@
 
   /** Read what the Host still holds for this session (session/state.queue). */
   function refreshQueue() {
-    if (!S.cur) return;
+    if (!S.cur || S.cur.readonly) return;   // session/state does not take a subagent address
     var sid = S.cur.id;
     rpc('session/state', { request: { sessionId: sid } }).then(function (st) {
       if (!S.cur || S.cur.id !== sid) return;
@@ -2250,18 +2271,32 @@
         + '<div class="m"><span class="path">' + esc(f.path) + '</span></div></div></div>';
     });
 
-    var subs = p.subagentCatalog || p.subagent || null;
-    var kids = [];
+    // Subagents are not in the session list (the Host refuses to address them as ordinary
+    // sessions), so the parent's own panel is where they are listed and opened.
+    var catalog = {};
     (cur.records || []).forEach(function (r) {
       var e = r.event || {};
-      if (e.type === 'subagent/catalog' && e.data && e.data.childId) kids.push(e.data);
+      if (e.type === 'subagent/catalog' && e.data && e.data.childId) catalog[e.data.childId] = e.data;
+    });
+    var kids = childrenOf(cur.id);
+    Object.keys(catalog).forEach(function (id) {
+      if (!kids.some(function (k) { return k.sessionId === id; })) {
+        kids.push({ sessionId: id, _catalogOnly: true, _label: catalog[id].label, _mode: catalog[id].mode });
+      }
     });
     if (kids.length) {
       html += '<h2>子代理 ' + kids.length + '</h2>';
+      html += '<div class="hint">子代理会话不属于会话列表，从这里进入（只读）。</div>';
       kids.forEach(function (k) {
-        html += '<div class="row" data-open="' + esc(k.childId) + '"><div class="grow">'
-          + '<div class="t">' + esc(k.label || k.childId) + '</div>'
-          + '<div class="m"><span>' + esc(k.mode || '') + '</span></div></div></div>';
+        var meta = catalog[k.sessionId] || {};
+        var title = k._label || ((k.projections && k.projections.values && k.projections.values.title) || k.sessionId);
+        var bits = [];
+        if (meta.mode || k._mode) bits.push(meta.mode || k._mode);
+        if (k.running) bits.push('运行中');
+        else if (k.updatedAt) bits.push(fmtTime(k.updatedAt));
+        html += '<div class="row" data-sub="' + esc(k.sessionId) + '"><div class="grow">'
+          + '<div class="t">' + esc(title) + '</div>'
+          + '<div class="m"><span>' + esc(bits.join(' · ')) + '</span></div></div></div>';
       });
     }
 
@@ -2269,8 +2304,14 @@
     html += '<h2>用量</h2><div class="hint">' + esc(stats || '暂无') + '</div>';
 
     box.innerHTML = html;
-    Array.prototype.forEach.call(box.querySelectorAll('[data-open]'), function (row) {
-      row.addEventListener('click', function () { openSession(row.dataset.open, '子代理'); });
+    Array.prototype.forEach.call(box.querySelectorAll('[data-sub]'), function (row) {
+      row.addEventListener('click', function () {
+        var childId = row.dataset.sub;
+        var child = byId(childId);
+        var t = (child && child.projections && child.projections.values && child.projections.values.title) || '子代理';
+        closePanel();
+        openSubagentSession(cur.id, childId, t);
+      });
     });
     Array.prototype.forEach.call(box.querySelectorAll('[data-path]'), function (row) {
       row.addEventListener('click', function () {
